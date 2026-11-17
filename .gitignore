@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+data/
+logs/
+.pytest_cache/
+# Local source files may contain personal data.
+*.xlsx
+*.docx
