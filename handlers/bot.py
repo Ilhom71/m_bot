@@ -12,7 +12,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
 from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 from db import STATUSES
-from excel_utils import MAX_FILE_SIZE, ValidationError, appeals_workbook, build_workbook, parse_datetime, parse_excel, phone_number
+from excel_utils import MAX_FILE_SIZE, ValidationError, appeals_workbook, build_workbook, import_notes, parse_datetime, parse_excel, phone_number
 from scheduler import appeal_list_text, pages
 
 logger = logging.getLogger(__name__)
@@ -108,6 +108,7 @@ async def document(update, context):
             added, skipped = db.import_appeals(rows)
             scheduled = db.apply_default_schedule(context.bot_data["settings"].timezone)
             message = f"{added} ta murojaat saqlandi (yangi yoki tahrirlangan); {skipped} ta o'zgarmagan qator takrorlanmadi.\n{scheduled} ta murojaat umumiy jadvalga avtomatik qo'yildi."
+            message += '\n' + import_notes(rows)
             if db.default_schedule():
                 message += "\nVaqti kelganda bot tasdiqlangan xodimlarga o'zi yuboradi. ID kiritish shart emas."
             if any(row.get("legacy") for row in rows):

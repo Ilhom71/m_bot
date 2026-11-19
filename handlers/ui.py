@@ -12,19 +12,21 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler, MessageHandler, filters
 
-from db import STATUSES
-from excel_utils import MAX_FILE_SIZE, ValidationError, parse_datetime, parse_excel, phone_number, shift_value
+from db import STATUSES, assignment_problem
+from excel_utils import MAX_FILE_SIZE, ValidationError, appeal_contact, import_notes, parse_datetime, parse_excel, phone_number, shift_value
 from . import bot as legacy
 
 WAIT = 1
+# Leave room for headings even when every body character uses two UTF-16 units.
+BODY_PAGE_SIZE = 1600
 STALE = "Bu tugma eskirgan, /menu bosing"
-PUBLIC_ROUTES = {"home", "cancel", "join", "mine", "appeal", "moretext", "own"}
+PUBLIC_ROUTES = {"home", "cancel", "join", "mine", "appeal", "moretext", "own", "done"}
 ROUTES = PUBLIC_ROUTES | {"appeals", "list", "pages", "card", "staff", "workers", "worker",
     "add", "upload", "joins", "request", "approve", "reject", "schedule", "mode", "off",
     "status", "extra", "file", "send", "assign", "pick", "day", "date", "clock", "hour",
-    "custom", "retry", "unknown", "attempts", "confirm", "execute", "skip"}
+    "custom", "retry", "unknown", "attempts", "confirm", "execute", "skip", "disconnect", "sms", "smssettings", "smscard"}
 ADMIN_KEYS = {'📋 Murojaatlar': 'appeals', '👥 Xodimlar': 'staff', '⏰ Yuborish': 'schedule',
-              '📊 Holat': 'status', '⚙️ Qo‘shimcha': 'extra'}
+              '📊 Holat': 'status', '⚙️ Sozlamalar': 'extra', '⚙️ Qo‘shimcha': 'extra'}
 USER_KEYS = {'📋 Murojaatlarim': 'mine', '📱 Ulanish': 'join', '📱 Xodim sifatida ulanish': 'join',
              '✉️ Murojaat yuborish': 'appeal'}
 
@@ -84,7 +86,7 @@ async def home(update, context):
     state(context).pop('message', None)
     state(context)['session'] = secrets.token_hex(3)
     if admin(update, context):
-        rows = [['📋 Murojaatlar', '👥 Xodimlar'], ['⏰ Yuborish', '📊 Holat'], ['⚙️ Qo‘shimcha']]
+        rows = [['📋 Murojaatlar', '👥 Xodimlar'], ['⏰ Yuborish', '📊 Holat'], ['⚙️ Sozlamalar']]
     else:
         workers = db(context).employee_list()
         employee = any(r["telegram_id"] == update.effective_user.id for r in workers)
@@ -99,6 +101,16 @@ async def start(update, context):
         return ConversationHandler.END
     db(context).register_user(update.effective_user.id, update.effective_user.username)
     await home(update, context)
+    args = getattr(context, 'args', None) or []
+    if args:
+        target = re.fullmatch(r'task_([1-9][0-9]{0,18})', args[0]) if len(args) == 1 else None
+        if target:
+            try:
+                await dispatch(update, context, 'own', [target[1]])
+            except ValueError:
+                await show(update, context, 'Bu murojaat sizga biriktirilmagan yoki hozir mavjud emas.', back='mine:0')
+        else:
+            await show(update, context, 'Murojaat havolasi noto‘g‘ri. Murojaatlarim bo‘limidan tanlang.', back='mine:0')
     return WAIT
 
 
@@ -111,13 +123,41 @@ def appeal_rows(context, kind="all"):
     database = db(context)
     statuses = {r["id"]: r for r in database.list_appeals(context.bot_data["settings"].timezone, today=kind == "today")}
     with database.connect() as conn:
-        rows = [dict(r) for r in conn.execute("SELECT rowid AS number,id,client_name FROM appeals ORDER BY created_at DESC,rowid DESC")]
-    return [dict(r, **{k: v for k, v in statuses[r["id"]].items() if k != "id"}) for r in rows if r["id"] in statuses]
+        rows = [dict(r) for r in conn.execute("SELECT rowid AS number,id,client_name,source_json FROM appeals ORDER BY created_at DESC,rowid DESC")]
+    result = [dict(r, **{k: v for k, v in statuses[r["id"]].items() if k != "id"}) for r in rows if r["id"] in statuses]
+    if kind in ('unassigned', 'unconnected'):
+        result = [row for row in result if row['telegram'] != 'sent' and assignment_problem(row) == kind]
+    elif kind == 'completed':
+        result = [row for row in result if row['completed_at'] is not None]
+    elif kind == 'sent':
+        result = [row for row in result if row['telegram'] == 'sent']
+    elif kind == 'unsent':
+        result = [row for row in result if row['telegram'] != 'sent' and row['completed_at'] is None]
+    elif kind == 'sms':
+        result = [row for row in result if row['due_at'] is not None and row['due_at'] <= time.time() and row['sms'] != 'sent']
+    return result
+
+
+def attention_reasons(row):
+    if row.get('completed_at') is not None or row['telegram'] == 'sent':
+        return []
+    reasons = []
+    if row['telegram'] == 'failed':
+        reasons.append('Telegram: yuborishda xato')
+    elif row['telegram'] == 'unknown':
+        reasons.append('Telegram: yuborish natijasi noma’lum')
+    problem = assignment_problem(row)
+    if problem == 'unassigned':
+        reasons.append('Xodim biriktirilmagan')
+    elif problem == 'unconnected':
+        reasons.append('Xodimning ulanishi tasdiqlanmagan')
+    if row['due_at'] is None:
+        reasons.append('Yuborish vaqti belgilanmagan')
+    return reasons
 
 
 def attention(row):
-    return (row["telegram"] in ("unknown", "failed") or row["sms"] in ("unknown", "failed")
-            or not row["employee"] or not row["employee_approved"] or row["due_at"] is None)
+    return bool(attention_reasons(row))
 
 
 def appeal_id(context, number):
@@ -133,6 +173,13 @@ def snapshot(context, number):
     return hashlib.sha256(json.dumps(db(context).details(identifier), sort_keys=True).encode()).hexdigest()
 
 
+def worker_snapshot(context, identifier):
+    worker = next((r for r in db(context).employee_list() if r['id'] == int(identifier)), None)
+    if worker is None:
+        raise ValueError(STALE)
+    return hashlib.sha256(json.dumps(worker, sort_keys=True).encode()).hexdigest()
+
+
 async def listing(update, context, kind, page=0):
     rows = appeal_rows(context, kind)
     if kind == "attention":
@@ -141,46 +188,92 @@ async def listing(update, context, kind, page=0):
     page = max(0, min(int(page), total - 1))
     buttons = []
     for row in rows[page*5:page*5+5]:
-        icon = "⚠️" if attention(row) else "✅" if row["telegram"] == row["sms"] == "sent" else "⏳"
-        buttons.append([button(context, f"{icon} {row['client_name'][:40]}", f"card:{row['number']}")])
+        status = '🏁 Bajarildi' if row['completed_at'] is not None else '✅ Yuborildi' if row['telegram'] == 'sent' else '⚠️ E’tibor kerak' if attention(row) else '⏳ Kutilmoqda'
+        if kind == 'sms':
+            status = 'SMS: ' + STATUSES[row['sms']]
+            if row['sms_held']:
+                status = 'SMS: qo‘lda yuboriladi' if row['sms'] != 'unknown' else 'SMS: natija noma’lum'
+        label = appeal_contact(row)[1] or f"Murojaat #{row['id']}"
+        route = 'smscard' if kind == 'sms' else 'card'
+        buttons.append([button(context, f"{status} — {label[:80]}", f"{route}:{row['number']}")])
     if total > 1:
         buttons.append([button(context, f"◀️ {page+1}/{total} ▶️", f"pages:{kind}:{page}:list")])
-    state(context)["list_back"] = f"list:{kind}:{page}"
-    await show(update, context, f"{'Bugungi' if kind == 'today' else 'Barcha' if kind == 'all' else 'E’tibor talab qiladigan'} murojaatlar: {len(rows)}", buttons, "appeals")
+    state(context)['sms_back' if kind == 'sms' else 'list_back'] = f"list:{kind}:{page}"
+    title = {'today': 'Bugungi', 'all': 'Barcha', 'unassigned': 'Mos xodim topilmagan',
+             'unconnected': 'Xodimi ulanmagan', 'completed': 'Bajarilgan', 'sent': 'Yuborilgan',
+             'unsent': 'Yuborilmagan'}.get(kind, 'E’tibor talab qiladigan')
+    text = f"{title} murojaatlar: {len(rows)}"
+    if kind == 'sms':
+        text = f"SMSda bormaganlar: {len(rows)}\nVaqti kelgan va SMS qabul qilingani tasdiqlanmagan murojaatlar.\nNoma’lum natijani qabul qiluvchidan tekshiring."
+    await show(update, context, text, buttons, 'smssettings' if kind == 'sms' else 'appeals')
 
 
-async def card(update, context, number, attempts=False):
+async def card(update, context, number):
     identifier = appeal_id(context, number)
     row, channels = db(context).details(identifier)
     employees = {e["id"]: e for e in db(context).employee_list()}
     employee = employees.get(row["employee_id"])
     zone = context.bot_data["settings"].timezone
     when = datetime.fromtimestamp(row["due_at"], zone).strftime("%d.%m.%Y %H:%M") if row["due_at"] else "belgilanmagan"
-    text = f"Mijoz: {row['client_name'][:150]}\nTelefon: {row['phone']}\nXodim: {employee['name'] if employee else row['employee_hint'] or 'biriktirilmagan'}\nVaqt: {when}\n\n"
-    summary = "\n".join(f"{c['channel'].upper()}: {STATUSES[c['status']]} | urinish: {c['attempts']}" for c in channels)
+    label, name = appeal_contact(row)
+    contact_line = f"{label}: {name[:150]}\n" if name else ""
+    text = f"{contact_line}Telefon: {row['phone']}\nXodim: {employee['name'] if employee else row['employee_hint'] or 'biriktirilmagan'}\nVaqt: {when}\n\n"
+    if row['completed_at'] is not None:
+        text += 'Ijro: ✅ Bajarildi — ' + datetime.fromtimestamp(row['completed_at'], zone).strftime('%d.%m.%Y %H:%M') + '\n\n'
+    telegram = next(c for c in channels if c['channel'] == 'telegram')
+    summary = 'Holat: ' + ('✅ Yuborildi' if telegram['status'] == 'sent' else STATUSES[telegram['status']])
+    status_row = dict(row, **{c['channel']: c['status'] for c in channels},
+                      employee_approved=employee['approved'] if employee else False,
+                      employee_telegram_id=employee['telegram_id'] if employee else None)
+    reasons = attention_reasons(status_row)
+    if reasons:
+        text += '⚠️ E’tibor sababi:\n' + '\n'.join(reasons) + '\n\n'
     body = row['body']
-    text += body[:2400] + ("\n… Davomi tugmasida." if len(body) > 2400 else "") + "\n\n" + summary
+    text += body[:BODY_PAGE_SIZE] + ("\n… Davomi tugmasida." if len(body) > BODY_PAGE_SIZE else "") + "\n\n" + summary
     buttons = []
-    unlocked = all(c["attempts"] == 0 and c["status"] not in ("sent", "sending", "unknown") for c in channels)
+    unlocked = row['completed_at'] is None and all(c["attempts"] == 0 and c["status"] not in ("sent", "sending", "unknown") for c in channels)
     if unlocked:
         buttons += [[button(context, "📨 Hozir yuborish", f"send:{number}"), button(context, "📅 Vaqt belgilash", f"day:{number}")],
                     [button(context, "👤 Xodim biriktirish", f"assign:{number}:0")]]
-    if attempts:
-        text += "\n\n" + "\n".join(f"{c['channel']}: {c['last_error'] or 'xato yo‘q'}" for c in channels)
-        text += "\n" + "\n".join(f"SMS {c['phone']}: {STATUSES[c['status']]} | urinish: {c['attempts']} | {c['last_error'] or 'xato yo‘q'}" for c in db(context).sms_details(identifier))
-        buttons = []
-    else:
-        for channel in channels:
-            name = channel['channel']
-            if channel["status"] == "failed":
-                buttons.append([button(context, f"🔄 Qayta urinish ({name.upper()})", f"retry:{number}:{name}")])
-            if channel["status"] == "unknown":
-                buttons.append([button(context, f"{name.upper()}: natijani belgilash", f"unknown:{number}:{name}")])
-        if any(c['attempts'] or c['status'] == 'blocked' for c in channels):
-            buttons.append([button(context, "Urinishlar", f"attempts:{number}")])
-        if len(body) > 2400:
-            buttons.append([button(context, "Matn davomi", f"moretext:{number}:1")])
+    if telegram['status'] == 'failed' and row['completed_at'] is None:
+        buttons.append([button(context, '🔄 Qayta urinish', f'retry:{number}:telegram')])
+    if telegram['status'] == 'unknown':
+        buttons.append([button(context, 'Natijani belgilash', f'unknown:{number}:telegram')])
+    if len(body) > BODY_PAGE_SIZE:
+        buttons.append([button(context, "Matn davomi", f"moretext:{number}:1")])
     await show(update, context, text, buttons, state(context).get("list_back", "list:all:0"))
+
+
+async def sms_card(update, context, number):
+    identifier = appeal_id(context, number)
+    row, channels = db(context).details(identifier)
+    channel = next(c for c in channels if c['channel'] == 'sms')
+    employee = next((e for e in db(context).employee_list() if e['id'] == row['employee_id']), None)
+    text = f"SMS — Murojaat #{identifier}\nXodim: {employee['name'] if employee else 'biriktirilmagan'}\nHolat: {STATUSES[channel['status']]}"
+    enabled = db(context).sms_enabled()
+    text += '\nSMS yuborish: ' + ('yoqilgan' if enabled else 'o‘chirilgan')
+    recipients = db(context).sms_details(identifier)
+    if not recipients and not row['sms_held']:
+        text += '\nSMS hali navbatga olinmagan. Yuborish vaqti va xodim ulanishini tekshiring.'
+    for recipient in recipients:
+        text += f"\n\n{recipient['phone']}\n{STATUSES[recipient['status']]} | urinish: {recipient['attempts']}"
+        if recipient['last_error']:
+            text += '\nSabab: ' + recipient['last_error']
+    if channel['status'] == 'unknown':
+        text += '\n\nNatija noma’lum: qayta yuborishdan oldin qabul qiluvchidan tekshiring.'
+    if row['completed_at'] is not None:
+        text += '\n\nMurojaat bajarilgan; qayta yuborilmaydi.'
+    buttons = []
+    if row['sms_held']:
+        text += '\n\nSMS qayta yoqilganda yuborish vaqti o‘tgan edi. Bu SMS avtomatik yuborilmaydi.'
+    if row['completed_at'] is None and row['sms_held'] and enabled and any(
+            entry['status'] in ('pending', 'retry', 'failed', 'blocked') for entry in (recipients or [channel])):
+        buttons.append([button(context, '📨 SMSni navbatga qo‘yish', f'retry:{number}:sms')])
+    elif row['completed_at'] is None and not row['sms_held'] and channel['status'] in ('failed', 'blocked'):
+        buttons.append([button(context, '🔄 SMS qayta urinish', f'retry:{number}:sms')])
+    if channel['status'] == 'unknown':
+        buttons.append([button(context, 'SMS natijasini belgilash', f'unknown:{number}:sms')])
+    await show(update, context, text, buttons, state(context).get('sms_back', 'list:sms:0'))
 
 
 async def choose_workers(update, context, number=None, page=0):
@@ -188,7 +281,8 @@ async def choose_workers(update, context, number=None, page=0):
     total = max(1, (len(rows) + 4) // 5)
     page = max(0, min(int(page), total - 1))
     visible = rows[page*5:page*5+5]
-    buttons = [[button(context, f"{page*5+i}. {r['name'][:48]}",
+    notes = {r['id']: '' if r['approved'] and r['telegram_id'] else ' — ulanmagan' for r in visible}
+    buttons = [[button(context, f"{page*5+i}. {r['name'][:48]}{notes[r['id']]}",
                        f"pick:{number}:{r['id']}" if number is not None else f"worker:{r['id']}")]
                for i, r in enumerate(visible, 1)]
     if total > 1:
@@ -197,7 +291,7 @@ async def choose_workers(update, context, number=None, page=0):
     if number is None:
         state(context)['workers_back'] = f'workers:{page}'
     text = (f"👥 Xodimlar — jami {len(rows)} ta\nSahifa {page+1}/{total}\n\n" +
-            "\n\n".join(f"{page*5+i}. {r['name']}" for i, r in enumerate(visible, 1)) +
+            "\n\n".join(f"{page*5+i}. {r['name']}{notes[r['id']]}" for i, r in enumerate(visible, 1)) +
             ("\n\nBiriktirish uchun xodimni tanlang." if number is not None else "\n\nTelefon va ulanish holatini ko‘rish uchun xodimni bosing.")) if rows else "Xodimlar ro‘yxati bo‘sh."
     await show(update, context, text, buttons, f"card:{number}" if number is not None else "staff")
 
@@ -219,9 +313,11 @@ async def prompt(update, context, flow, question, back="home", extra=None):
 
 async def confirm_action(update, context, action, number=None, channel=None, sent=None):
     state(context)["pending"] = dict(action=action, number=number, channel=channel, sent=sent,
-        snapshot=snapshot(context, number) if action != "reject" else None)
-    await show(update, context, "Ishonchingiz komilmi? Qabul qiluvchidan natijani tekshiring. Bu amal qayta yuborishga olib kelishi mumkin.",
-               [[button(context, "✅ Ha", "execute"), button(context, "❌ Yo‘q", f"card:{number}" if action != "reject" else "joins:0")]])
+        snapshot=worker_snapshot(context, number) if action == 'disconnect' else snapshot(context, number) if action != "reject" else None)
+    question = 'Xodimning bot bilan ulanishi uzilsinmi?' if action == 'disconnect' else "Ishonchingiz komilmi? Qabul qiluvchidan natijani tekshiring. Bu amal qayta yuborishga olib kelishi mumkin."
+    back = f'worker:{number}' if action == 'disconnect' else 'joins:0' if action == 'reject' else f'smscard:{number}' if channel == 'sms' else f'card:{number}'
+    await show(update, context, question,
+               [[button(context, "✅ Ha", "execute"), button(context, "❌ Yo‘q", back)]])
 
 
 async def callback(update, context):
@@ -253,7 +349,8 @@ async def dispatch(update, context, route, args):
         await home(update, context)
     elif route == 'appeals':
         await show(update, context, "Murojaatlar", [[button(context, label, action)] for label, action in
-            (("Bugun", "list:today:0"), ("Hammasi", "list:all:0"), ("Excel yuklash", "upload:appeals"))])
+            (("Bugun", "list:today:0"), ("Yuborilgan", "list:sent:0"), ("Yuborilmagan", "list:unsent:0"),
+             ("Hammasi", "list:all:0"), ("Excel yuklash", "upload:appeals"))])
     elif route == 'list':
         await listing(update, context, args[0], int(args[1]))
     elif route == 'pages':
@@ -269,14 +366,16 @@ async def dispatch(update, context, route, args):
                 choices.append([button(context, label, action)])
         await show(update, context, "Sahifani almashtiring.", choices)
     elif route in ('card', 'attempts'):
-        await card(update, context, args[0], route == 'attempts')
+        await card(update, context, args[0])
+    elif route == 'smscard':
+        await sms_card(update, context, args[0])
     elif route == 'moretext':
         identifier = appeal_id(context, args[0])
         row = database.details(identifier)[0]
         if not admin(update, context) and not any(r['id'] == identifier for r in database.export_appeals(telegram_id=update.effective_user.id)):
             raise ValueError(STALE)
-        page = int(args[1]); text = row['body'][page*2400:(page+1)*2400]
-        buttons = [[button(context, 'Davomi ▶️', f"moretext:{args[0]}:{page+1}")]] if len(row['body']) > (page+1)*2400 else []
+        page = int(args[1]); text = row['body'][page*BODY_PAGE_SIZE:(page+1)*BODY_PAGE_SIZE]
+        buttons = [[button(context, 'Davomi ▶️', f"moretext:{args[0]}:{page+1}")]] if len(row['body']) > (page+1)*BODY_PAGE_SIZE else []
         await show(update, context, text or 'Matn tugadi.', buttons, f'card:{args[0]}' if admin(update, context) else 'mine:0')
     elif route == 'staff':
         await show(update, context, "Xodimlar", [[button(context, label, action)] for label, action in
@@ -294,7 +393,10 @@ async def dispatch(update, context, route, args):
             database.assign(appeal_id(context, args[0]), employee['name'])
             await card(update, context, args[0])
         else:
-            await show(update, context, f"👤 {employee['name']}\n\n📱 Asosiy telefon: {employee['phone']}\nQo‘shimcha telefon: {employee['phone_extra'] or 'yo‘q'}\n\nUlanish: {'✅ Tasdiqlangan' if employee['approved'] else '⏳ Ulanish yoki admin tasdig‘i kutilmoqda'}\nSmena: {employee['shift'] or 'cheklanmagan'}", back=ui.get('workers_back', 'workers:0'))
+            buttons = [[button(context, 'Ulanishni uzish', f"disconnect:{employee['id']}")]] if employee['telegram_id'] or employee['approved'] else []
+            await show(update, context, f"👤 {employee['name']}\n\n📱 Asosiy telefon: {employee['phone']}\nQo‘shimcha telefon: {employee['phone_extra'] or 'yo‘q'}\n\nUlanish: {'✅ Ulangan' if employee['approved'] and employee['telegram_id'] else '❌ Ulanmagan'}\nSmena: {employee['shift'] or 'cheklanmagan'}", buttons, back=ui.get('workers_back', 'workers:0'))
+    elif route == 'disconnect':
+        await confirm_action(update, context, 'disconnect', args[0])
     elif route == 'add':
         await prompt(update, context, {'kind': 'employee', 'values': []}, EMPLOYEE_QUESTIONS[0], 'staff')
     elif route == 'upload':
@@ -324,9 +426,18 @@ async def dispatch(update, context, route, args):
         await confirm_action(update, context, 'reject', args[0])
     elif route == 'schedule':
         mode = database.default_schedule()
+        sms_enabled = database.sms_enabled()
         text = 'Hozir avtomatik: yoqilgan' if mode == 'darhol' else f'Har kuni {mode}' if mode else 'Avtomatik yuborish: o‘chirilgan'
+        text += '\nSMS yuborish: ' + ('✅ Yoqilgan' if sms_enabled else '❌ O‘chirilgan')
+        text += '\nSMS qayta yoqilganda vaqti o‘tgan SMS’lar faqat qo‘lda navbatga qo‘yiladi.'
         await show(update, context, text + '\nExcelda alohida vaqt bo‘lsa, o‘sha vaqt ishlatiladi.',
-            [[button(context, 'Darhol', 'mode:darhol')], [button(context, 'Soat tanlash', 'clock:global')], [button(context, 'O‘chirish', 'off')]])
+            [[button(context, 'Darhol', 'mode:darhol')], [button(context, 'Soat tanlash', 'clock:global')], [button(context, 'O‘chirish', 'off')],
+             [button(context, '❌ SMS o‘chirish' if sms_enabled else '✅ SMS yoqish', 'sms:off' if sms_enabled else 'sms:on')]])
+    elif route == 'sms':
+        if len(args) not in (1, 2) or args[0] not in ('on', 'off') or (len(args) == 2 and args[1] not in ('extra', 'schedule', 'smssettings')):
+            raise ValueError(STALE)
+        database.set_sms_enabled(args[0] == 'on')
+        await dispatch(update, context, args[1] if len(args) == 2 else 'schedule', [])
     elif route == 'mode':
         database.set_default_schedule(':'.join(args), settings.timezone)
         database.assign_due(time.time(), settings.timezone)
@@ -337,12 +448,40 @@ async def dispatch(update, context, route, args):
             conn.execute("DELETE FROM settings WHERE key='default_send_time'")
         await show(update, context, 'Avtomatik jadval o‘chirildi. Oldin belgilangan yuborish vaqtlari saqlanadi.', back='schedule')
     elif route == 'status':
-        count = sum(attention(r) for r in appeal_rows(context))
-        await show(update, context, database.status_text().replace('/jadval ni tanlang', 'Yuborish bo‘limidan tanlang') + f'\n\nE’tibor talab qiladigan murojaatlar: {count}',
-            [[button(context, f'⚠️ E’tibor kerak ({count})', 'list:attention:0')]])
+        records = appeal_rows(context)
+        count = sum(attention(r) for r in records)
+        text = database.status_text(include_sms=False).replace('/jadval ni tanlang', 'Yuborish bo‘limidan tanlang') + f'\n\nE’tibor talab qiladigan murojaatlar: {count}'
+        buttons = []
+        if count:
+            reasons = {}
+            for row in records:
+                for reason in attention_reasons(row):
+                    reasons[reason] = reasons.get(reason, 0) + 1
+            text += '\nSabablar:\n' + '\n'.join(f'{reason}: {number} ta' for reason, number in reasons.items())
+            buttons.append([button(context, f'⚠️ E’tibor kerak ({count})', 'list:attention:0')])
+        else:
+            text += '\n✅ Yuborishda e’tibor talab qiladigan muammo yo‘q.'
+        await show(update, context, text, buttons +
+            [[button(context, 'Mos xodim topilmagan', 'list:unassigned:0')],
+             [button(context, 'Xodimi ulanmagan', 'list:unconnected:0')],
+             [button(context, '✅ Bajarilgan', 'list:completed:0')]])
     elif route == 'extra':
-        await show(update, context, 'Shablonlar va Excel tahrirlash', [[button(context, label, action)] for label, action in
+        sms_enabled = database.sms_enabled()
+        text = '⚙️ Sozlamalar\n\nSMS yuborish: ' + ('✅ Yoqilgan' if sms_enabled else '❌ O‘chirilgan')
+        text += '\nSMS qayta yoqilganda vaqti o‘tgan SMS’lar faqat qo‘lda navbatga qo‘yiladi.\n\nShablonlar va Excel tahrirlash'
+        sms_button = button(context, '❌ SMS o‘chirish' if sms_enabled else '✅ SMS yoqish',
+                            'sms:off:extra' if sms_enabled else 'sms:on:extra')
+        await show(update, context, text, [[button(context, '📱 SMS sozlamalari', 'smssettings')], [sms_button]] + [[button(context, label, action)] for label, action in
             (('Bo‘sh shablonlar', 'file:templates'), ('Xodimlarni Excel olish', 'file:employees'), ('Murojaatlarni Excel olish', 'file:appeals'))])
+    elif route == 'smssettings':
+        enabled = database.sms_enabled()
+        rows = appeal_rows(context, 'sms')
+        text = '📱 SMS sozlamalari\nSMS yuborish: ' + ('✅ Yoqilgan' if enabled else '❌ O‘chirilgan')
+        text += '\nSMS qayta yoqilganda vaqti o‘tgan SMS’lar faqat qo‘lda navbatga qo‘yiladi.'
+        text += f'\n\nSMSda bormaganlar: {len(rows)}\nBu ro‘yxatda faqat yuborish vaqti kelgan murojaatlar bor.'
+        await show(update, context, text,
+            [[button(context, '❌ SMS o‘chirish' if enabled else '✅ SMS yoqish', 'sms:off:smssettings' if enabled else 'sms:on:smssettings')],
+             [button(context, f'SMSda bormaganlar ({len(rows)})', 'list:sms:0')]], 'extra')
     elif route == 'file':
         await {'templates': legacy.templates, 'employees': legacy.export_employees, 'appeals': legacy.export_all}[args[0]](update, context)
     elif route == 'send':
@@ -368,13 +507,18 @@ async def dispatch(update, context, route, args):
         await confirm_action(update, context, 'retry', args[0], args[1])
     elif route == 'unknown':
         await show(update, context, f'{args[1].upper()} natijasini qabul qiluvchidan tekshiring.', [[button(context, 'Yuborildi', f'confirm:{args[0]}:{args[1]}:yes'),
-            button(context, 'Yuborilmadi', f'confirm:{args[0]}:{args[1]}:no')]], f'card:{args[0]}')
+            button(context, 'Yuborilmadi', f'confirm:{args[0]}:{args[1]}:no')]], f'smscard:{args[0]}' if args[1] == 'sms' else f'card:{args[0]}')
     elif route == 'confirm':
         await confirm_action(update, context, 'unknown', args[0], args[1], args[2] == 'yes')
     elif route == 'execute':
         pending = ui.pop('pending')
         number = pending['number']
-        if pending['action'] == 'reject':
+        if pending['action'] == 'disconnect':
+            if worker_snapshot(context, number) != pending['snapshot']:
+                raise ValueError(STALE)
+            database.disconnect_employee(int(number))
+            await dispatch(update, context, 'worker', [number])
+        elif pending['action'] == 'reject':
             legacy.decide_request(context, int(number), False, update.effective_user.id)
             await dispatch(update, context, 'joins', ['0'])
         else:
@@ -385,7 +529,10 @@ async def dispatch(update, context, route, args):
                 database.retry(identifier, pending['channel'])
             else:
                 database.resolve_unknown(identifier, pending['channel'], pending['sent'])
-            await card(update, context, number)
+            if pending['channel'] == 'sms':
+                await sms_card(update, context, number)
+            else:
+                await card(update, context, number)
     elif route == 'appeal':
         await prompt(update, context, {'kind': 'appeal', 'values': []}, APPEAL_QUESTIONS[0])
     elif route == 'skip':
@@ -406,19 +553,29 @@ async def dispatch(update, context, route, args):
         for row in rows[page*4:page*4+4]:
             with database.connect() as conn:
                 number = conn.execute('SELECT rowid FROM appeals WHERE id=?', (row['id'],)).fetchone()[0]
-            buttons.append([button(context, row['client_name'][:40], f'own:{number}')])
+            name = appeal_contact(row)[1] or f"Murojaat #{row['id']}"
+            buttons.append([button(context, name[:80], f'own:{number}')])
         if page > 0:
             buttons.append([button(context, '◀️ Oldingi', f'mine:{page-1}')])
         if (page+1)*4 < len(rows):
             buttons.append([button(context, 'Keyingi ▶️', f'mine:{page+1}')])
         await show(update, context, 'Murojaatingizni tanlang.' if rows else 'Sizga biriktirilgan va vaqti kelgan murojaat yo‘q.', buttons)
+    elif route == 'done':
+        identifier = appeal_id(context, args[0])
+        database.complete_appeal(identifier, update.effective_user.id, settings.admin_ids)
+        await dispatch(update, context, 'own', args)
     elif route == 'own':
         identifier = appeal_id(context, args[0])
-        row = next((r for r in database.export_appeals(telegram_id=update.effective_user.id) if r['id'] == identifier), None)
+        row = next(iter(database.export_appeals(telegram_id=update.effective_user.id, appeal_id=identifier)), None)
         if not row:
             raise ValueError(STALE)
-        buttons = [[button(context, 'Davomi ▶️', f'moretext:{args[0]}:1')]] if len(row['body']) > 2400 else []
-        await show(update, context, f"Mijoz: {row['client_name'][:150]}\nTelefon: {row['phone']}\n\n{row['body'][:2400]}", buttons, 'mine:0')
+        buttons = [[button(context, 'Davomi ▶️', f'moretext:{args[0]}:1')]] if len(row['body']) > BODY_PAGE_SIZE else []
+        if row['completed_at'] is None:
+            buttons.append([button(context, '✅ Bajarildi', f'done:{args[0]}')])
+        progress = '✅ Bajarildi' if row['completed_at'] is not None else '⏳ Kutilmoqda'
+        label, name = appeal_contact(row)
+        contact_line = f"{label}: {name[:150]}\n" if name else ""
+        await show(update, context, f"Murojaat #{row['id']}\n{contact_line}Telefon: {row['phone']}\nIjro: {progress}\n\n{row['body'][:BODY_PAGE_SIZE]}", buttons, 'mine:0')
 
 
 EMPLOYEE_QUESTIONS = ['Xodim ismini yozing. Masalan: Aliyev Vali', 'Asosiy telefonni yozing. Masalan: 90 123 45 67',
@@ -559,6 +716,7 @@ async def import_document(update, context, kind):
         added, skipped = database.import_appeals(rows)
         scheduled = database.apply_default_schedule(context.bot_data['settings'].timezone)
         text = f'{added} ta murojaat saqlandi; {skipped} ta o‘zgarmagan qator. {scheduled} ta murojaat jadvalga olindi.'
+        text += '\n\n' + import_notes(rows)
     database.assign_due(time.time(), context.bot_data['settings'].timezone)
     clear_flow(context)
     buttons = []

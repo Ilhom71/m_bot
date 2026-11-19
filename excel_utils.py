@@ -9,8 +9,19 @@ from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+from config import TIMEZONE
 
 MAX_FILE_SIZE = 5 * 1024 * 1024
+LEGACY_DEADLINE_WARNING = ("⚠️ Муддати — hujjat ijro muddati; yuborish vaqti sifatida olinmadi. "
+                           "Yuborish bo'limidan vaqt tanlang yoki yuborish_vaqti ustunini to'ldiring.")
+
+
+def import_notes(rows):
+    notes = ["Bir xil ID va bir xil ma'lumot takroran yuborilmaydi. Tahrir faqat yuborish boshlanmaguncha mumkin; "
+             "bo'sh vaqt/xodim oldingi qiymatni saqlaydi. Yangi murojaatga yangi ID bering."]
+    if any('муддати' in row.get('source_data', {}) for row in rows):
+        notes.append(LEGACY_DEADLINE_WARNING)
+    return "\n".join(notes)
 HEADERS = {
     "appeals": ("id", "mijoz_ismi", "telefon", "murojaat_matni", "yuborish_vaqti"),
     "employees": ("ism", "telefon", "telegram_id"),
@@ -19,6 +30,7 @@ LEGACY_HEADERS = {
     "кириш рақами": "id", "аризачи": "mijoz_ismi",
     "ҳужжат мазмуни": "murojaat_matni", "кимга юборилган": "xodim",
 }
+LEGACY_SENDER_HEADER = "юборган ижрочи"
 
 
 class ValidationError(ValueError):
@@ -39,18 +51,30 @@ def normalized_header(value):
     return " ".join(clean(value).casefold().split())
 
 
+def appeal_contact(row):
+    name = clean(row["client_name"])
+    if name and name.casefold().replace("‘", "'").replace("’", "'") != "ko'rsatilmagan":
+        return "Mijoz", name
+    source = json.loads(row.get("source_json") or "{}")
+    sender = clean(source.get(LEGACY_SENDER_HEADER))
+    if sender:
+        return "Юборган ижрочи", sender
+    return "Mijoz", ""
+
+
 def phone_number(value):
     value = re.sub(r"[\s()\-]", "", clean(value))
     if re.fullmatch(r"\d{9}", value):
         value = "+998" + value
     elif re.fullmatch(r"998\d{9}", value):
         value = "+" + value
-    if not re.fullmatch(r"\+998\d{9}", value):
+    if not re.fullmatch(r"\+998[0-9]{9}", value):
         raise ValueError("telefon +998XXXXXXXXX formatida bo'lsin, masalan +998901234567")
     return value
 
 
 def parse_datetime(value, timezone):
+    timezone = TIMEZONE
     if isinstance(value, datetime):
         result = value
     else:
@@ -84,6 +108,7 @@ def in_shift(shift, moment):
 
 
 def parse_excel(payload: bytes, kind: str, timezone: ZoneInfo) -> list[dict]:
+    timezone = TIMEZONE
     if len(payload) > MAX_FILE_SIZE:
         raise ValidationError(["Fayl 5 MB dan oshmasin."])
     try:
@@ -108,7 +133,8 @@ def parse_excel(payload: bytes, kind: str, timezone: ZoneInfo) -> list[dict]:
         header_row, legacy = 1, False
         if kind == "appeals" and "id" not in header:
             while True:
-                if set(LEGACY_HEADERS).issubset(header):
+                legacy_required = set(LEGACY_HEADERS) - {"аризачи"}
+                if legacy_required.issubset(header) and ("аризачи" in header or LEGACY_SENDER_HEADER in header):
                     legacy = True
                     break
                 if header_row >= 20:
@@ -123,7 +149,7 @@ def parse_excel(payload: bytes, kind: str, timezone: ZoneInfo) -> list[dict]:
             header = [LEGACY_HEADERS.get(name, name) for name in header]
         missing = sorted(set(HEADERS[kind]) - set(header))
         if legacy:
-            missing = [name for name in missing if name not in ("telefon", "yuborish_vaqti")]
+            missing = [name for name in missing if name not in ("telefon", "yuborish_vaqti", "mijoz_ismi")]
         if kind == "employees":
             missing = [name for name in missing if name != "telegram_id"]
         if missing:
@@ -161,7 +187,7 @@ def parse_excel(payload: bytes, kind: str, timezone: ZoneInfo) -> list[dict]:
                             raise ValueError("Telegram identifikatori faylda takrorlangan")
                 else:
                     appeal_id = clean(row["id"])
-                    name, body = clean(row["mijoz_ismi"]), clean(row["murojaat_matni"])
+                    name, body = clean(row.get("mijoz_ismi")), clean(row["murojaat_matni"])
                     if legacy:
                         if not appeal_id:
                             raise ValueError("Kirish raqami bo'sh")
@@ -185,7 +211,8 @@ def parse_excel(payload: bytes, kind: str, timezone: ZoneInfo) -> list[dict]:
                                 employee_ref=clean(row.get("xodim")), legacy=legacy_row, source_data=source_data)
                     key = appeal_id
                 if key in seen:
-                    raise ValueError("id yoki ism faylda takrorlangan")
+                    raise ValueError(f"ID '{key}' faylda takrorlangan; har bir ID faqat bitta qatorda bo'lsin" if kind == 'appeals'
+                                     else "ism faylda takrorlangan")
                 seen.add(key)
                 item["row_number"] = row_number
                 output.append(item)
@@ -230,6 +257,7 @@ def build_workbook(columns, rows, title="Murojaatlar"):
 
 
 def appeals_workbook(rows, timezone):
+    timezone = TIMEZONE
     sources = [json.loads(row.get("source_json") or "{}") for row in rows]
     keys = list(dict.fromkeys(key for source in sources for key in source))
     columns = ["id", "mijoz_ismi", "telefon", "murojaat_matni", "yuborish_vaqti", "xodim", "manba_formati"]

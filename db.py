@@ -1,18 +1,32 @@
 """SQLite outbox and atomic state transitions."""
 import json
+import os
 import re
 import sqlite3
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
+from contextlib import closing
 
 from excel_utils import ValidationError, in_shift, phone_number
+from config import TIMEZONE
 
 STATUSES = {
     "pending": "kutmoqda", "retry": "qayta urinish", "sending": "yuborilmoqda",
     "sent": "yuborildi", "failed": "xato", "unknown": "natija noma'lum",
     "blocked": "SMS API kutilmoqda",
 }
+
+
+def assignment_problem(row):
+    if row.get('completed_at') is not None:
+        return None
+    if not row.get('employee_id'):
+        return 'unassigned'
+    if not row.get('employee_approved') or not row.get('employee_telegram_id'):
+        return 'unconnected'
+    return None
 
 
 class Database:
@@ -64,17 +78,24 @@ class Database:
                     updated_at REAL NOT NULL, PRIMARY KEY(appeal_id,phone)
                 );
             """)
+            conn.execute("BEGIN IMMEDIATE")
             # Additive migration: existing contacts also require explicit approval.
             for table, columns in {
                 "employees": {"approved": "INTEGER NOT NULL DEFAULT 0", "phone_extra": "TEXT"},
                 "deliveries": {"part_index": "INTEGER NOT NULL DEFAULT 0"},
                 "appeals": {"employee_hint": "TEXT NOT NULL DEFAULT ''", "source_json": "TEXT NOT NULL DEFAULT '{}'",
-                            "legacy": "INTEGER NOT NULL DEFAULT 0", "schedule_source": "TEXT NOT NULL DEFAULT 'explicit'"},
+                            "legacy": "INTEGER NOT NULL DEFAULT 0", "schedule_source": "TEXT NOT NULL DEFAULT 'explicit'",
+                            "completed_at": "REAL", "completed_by": "INTEGER",
+                            "sms_held": "INTEGER NOT NULL DEFAULT 0"},
+                "notices": {"updated_at": "REAL NOT NULL DEFAULT 0"},
             }.items():
                 present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
                 for name, definition in columns.items():
                     if name not in present:
                         conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+                        if table == 'appeals' and name == 'sms_held':
+                            # Protect the old backlog if SMS had already been explicitly enabled.
+                            self._hold_overdue_sms(conn, previous_setting='1')
 
     @contextmanager
     def connect(self):
@@ -101,6 +122,9 @@ class Database:
     def request_join(self, employee_id, telegram_id):
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM employees WHERE telegram_id=? AND approved=1 AND id<>?",
+                            (telegram_id, employee_id)).fetchone():
+                raise ValueError("Bu Telegram hisobi boshqa xodimga ulangan.")
             employee = conn.execute("SELECT * FROM employees WHERE id=?", (employee_id,)).fetchone()
             if not employee:
                 raise ValueError("Xodim topilmadi. Admin avval xodimlar Excel faylini yuklasin.")
@@ -137,7 +161,7 @@ class Database:
             if not request:
                 raise ValueError("So'rov topilmadi yoki allaqachon ko'rib chiqilgan.")
             if approve:
-                conflict = conn.execute("SELECT id FROM employees WHERE approved=1 AND telegram_id=? AND id<>?",
+                conflict = conn.execute("SELECT id FROM employees WHERE telegram_id=? AND id<>?",
                                         (request["telegram_id"], request["employee_id"])).fetchone()
                 if conflict:
                     raise ValueError("Bu Telegram hisobi boshqa xodimga tasdiqlangan.")
@@ -173,6 +197,8 @@ class Database:
                 ref = row["telegram_ref"]
                 user = conn.execute("SELECT telegram_id FROM users WHERE username=?", (ref,)).fetchone()
                 tid = int(ref) if ref.isdigit() else user[0] if user else None
+                if tid and conn.execute("SELECT 1 FROM employees WHERE telegram_id=? AND name_key<>?", (tid, row['name'].casefold())).fetchone():
+                    raise ValidationError([f"{row['row_number']}-qator: Telegram akkaunt boshqa xodimda mavjud."])
                 try:
                     previous = conn.execute("SELECT * FROM employees WHERE name_key=?", (row["name"].casefold(),)).fetchone()
                     if previous and (previous["telegram_ref"] != ref or previous["phone"] != row["phone"] or previous['phone_extra'] != row['phone_extra']):
@@ -201,9 +227,13 @@ class Database:
 
     def import_appeals(self, rows):
         added = skipped = 0
+        seen = set()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             for row in rows:
+                if row['id'] in seen:
+                    raise ValidationError([f"{row['row_number']}-qator: ID '{row['id']}' faylda takrorlangan; har bir ID yagona bo'lsin."])
+                seen.add(row['id'])
                 try:
                     employee_id = self.resolve_employee(conn, row.get("employee_ref", ""))
                 except ValueError as exc:
@@ -223,8 +253,8 @@ class Database:
                                previous["due_at"] != due_at or previous["employee_id"] != employee_id or
                                previous["employee_hint"] != hint or previous["source_json"] != source_json)
                     if changed:
-                        if conn.execute("SELECT 1 FROM deliveries WHERE appeal_id=? AND (attempts>0 OR status IN ('sent','sending','unknown'))", (row["id"],)).fetchone():
-                            raise ValidationError([f"{row['row_number']}-qator: yuborish boshlangan murojaatni Excel orqali o'zgartirib bo'lmaydi."])
+                        if previous['completed_at'] is not None or conn.execute("SELECT 1 FROM deliveries WHERE appeal_id=? AND (attempts>0 OR status IN ('sent','sending','unknown'))", (row["id"],)).fetchone():
+                            raise ValidationError([f"{row['row_number']}-qator: ID '{row['id']}' mavjud; yuborish boshlangan yoki bajarilgan murojaatni o'zgartirib bo'lmaydi. Yangi murojaatga yangi ID bering. Butun import bekor qilindi."])
                         conn.execute("""UPDATE appeals SET client_name=?,phone=?,body=?,due_at=?,employee_id=?,employee_hint=?,source_json=?,
                             schedule_source=CASE WHEN ? THEN 'explicit' ELSE schedule_source END WHERE id=?""",
                                      (row["client_name"], row["phone"], row["body"], due_at, employee_id, hint, source_json,
@@ -255,8 +285,30 @@ class Database:
             row = conn.execute("SELECT value FROM settings WHERE key='default_send_time'").fetchone()
             return row[0] if row else None
 
+    def sms_enabled(self):
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key='sms_enabled'").fetchone()
+            return row is None or row[0] != '0'
+
+    def set_sms_enabled(self, enabled):
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if enabled:
+                self._hold_overdue_sms(conn, previous_setting='0')
+            conn.execute("INSERT INTO settings(key,value) VALUES ('sms_enabled',?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", ('1' if enabled else '0',))
+
+    @staticmethod
+    def _hold_overdue_sms(conn, previous_setting):
+        conn.execute("""UPDATE appeals SET sms_held=1
+            WHERE due_at<=? AND completed_at IS NULL
+            AND EXISTS (SELECT 1 FROM settings WHERE key='sms_enabled' AND value=?)
+            AND EXISTS (SELECT 1 FROM deliveries WHERE appeal_id=appeals.id AND channel='sms' AND status!='sent')""",
+            (time.time(), previous_setting))
+
     @staticmethod
     def next_send_time(mode, timezone, now):
+        timezone = TIMEZONE
         if mode == "darhol":
             return now
         hour, minute = map(int, mode.split(":"))
@@ -280,7 +332,7 @@ class Database:
     def _schedule_waiting(cls, conn, mode, timezone, now, change_future=False):
         due_at = cls.next_send_time(mode, timezone, now)
         result = conn.execute("""UPDATE appeals SET due_at=?,schedule_source='automatic'
-            WHERE (due_at IS NULL OR (? AND schedule_source='automatic' AND due_at>?))
+            WHERE completed_at IS NULL AND (due_at IS NULL OR (? AND schedule_source='automatic' AND due_at>?))
             AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.appeal_id=appeals.id
                 AND (d.attempts>0 OR d.status IN ('sent','sending','unknown')))""", (due_at, int(change_future), now))
         return result.rowcount
@@ -293,9 +345,10 @@ class Database:
             return self._schedule_waiting(conn, row[0], timezone, now) if row else 0
 
     def assign_due(self, now, timezone):
+        timezone = TIMEZONE
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            rows = conn.execute("SELECT id,due_at,employee_hint FROM appeals WHERE employee_id IS NULL ORDER BY due_at,id").fetchall()
+            rows = conn.execute("SELECT id,due_at,employee_hint FROM appeals WHERE employee_id IS NULL AND completed_at IS NULL ORDER BY due_at,id").fetchall()
             for row in rows:
                 if row["employee_hint"]:
                     try:
@@ -319,7 +372,8 @@ class Database:
             # Freeze recipients when a due, approved delivery first enters the worker.
             for row in conn.execute("""SELECT d.*,e.phone,e.phone_extra FROM deliveries d
                 JOIN appeals a ON a.id=d.appeal_id JOIN employees e ON e.id=a.employee_id
-                WHERE d.channel='sms' AND a.due_at<=? AND e.approved=1""", (now,)).fetchall():
+                WHERE d.channel='sms' AND a.due_at<=? AND a.completed_at IS NULL AND a.sms_held=0 AND e.approved=1 AND e.telegram_id IS NOT NULL
+                AND NOT EXISTS (SELECT 1 FROM settings WHERE key='sms_enabled' AND value='0')""", (now,)).fetchall():
                 existing = conn.execute('SELECT * FROM sms_deliveries WHERE appeal_id=?', (row['appeal_id'],)).fetchall()
                 if existing and any(s['attempts'] > 0 or s['status'] not in ('pending','blocked') for s in existing):
                     continue
@@ -336,15 +390,17 @@ class Database:
                          row['attempts'] if index == 0 else 0, row['next_attempt'] if index == 0 else 0,
                          row['last_error'] if index == 0 else None, row['message_id'] if index == 0 else None, now))
                 self._aggregate_sms(conn, row['appeal_id'])
-            telegram = [dict(row) for row in conn.execute("""SELECT d.*,a.client_name,a.phone AS client_phone,a.body,
+            telegram = [dict(row) for row in conn.execute("""SELECT d.*,a.client_name,a.phone AS client_phone,a.body,a.source_json,
                 e.name AS employee_name,e.phone AS employee_phone,e.telegram_id
                 FROM deliveries d JOIN appeals a ON a.id=d.appeal_id JOIN employees e ON e.id=a.employee_id
-                WHERE d.channel='telegram' AND a.due_at<=? AND e.approved=1 AND d.status IN ('pending','retry','blocked')
+                WHERE d.channel='telegram' AND a.due_at<=? AND a.completed_at IS NULL AND e.approved=1 AND d.status IN ('pending','retry','blocked')
                 AND d.next_attempt<=? ORDER BY a.due_at,d.channel LIMIT 100""", (now, now))]
             sms_rows = [dict(row) for row in conn.execute("""SELECT s.*, 'sms' AS channel, s.phone AS target_phone,
-                a.client_name,a.phone AS client_phone,a.body,e.name AS employee_name,e.phone AS employee_phone,e.telegram_id
+                a.rowid AS appeal_number,a.client_name,a.phone AS client_phone,a.body,
+                e.name AS employee_name,e.phone AS employee_phone,e.telegram_id
                 FROM sms_deliveries s JOIN appeals a ON a.id=s.appeal_id JOIN employees e ON e.id=a.employee_id
-                WHERE a.due_at<=? AND e.approved=1 AND s.status IN ('pending','retry','blocked') AND s.next_attempt<=?
+                WHERE a.due_at<=? AND a.completed_at IS NULL AND a.sms_held=0 AND e.approved=1 AND s.status IN ('pending','retry','blocked') AND s.next_attempt<=?
+                AND NOT EXISTS (SELECT 1 FROM settings WHERE key='sms_enabled' AND value='0')
                 ORDER BY a.due_at LIMIT 100""", (now, now))]
             return telegram + sms_rows
 
@@ -355,18 +411,23 @@ class Database:
             return
         priority = ('unknown','failed','sending','retry','blocked','pending','sent')
         status = next(value for value in priority if any(row['status'] == value for row in rows))
+        attempts = max(row['attempts'] for row in rows)
+        next_attempt = min(row['next_attempt'] for row in rows)
+        error = next(row['last_error'] for row in rows if row['status'] == status)
         conn.execute("""UPDATE deliveries SET status=?,attempts=?,next_attempt=?,last_error=?,updated_at=?
-            WHERE appeal_id=? AND channel='sms'""", (status, max(row['attempts'] for row in rows),
-            min(row['next_attempt'] for row in rows), next((row['last_error'] for row in rows if row['status']==status), None),
-            time.time(), appeal_id))
+            WHERE appeal_id=? AND channel='sms'
+            AND (status IS NOT ? OR attempts IS NOT ? OR next_attempt IS NOT ? OR last_error IS NOT ?)""",
+            (status, attempts, next_attempt, error, time.time(), appeal_id, status, attempts, next_attempt, error))
 
     def claim_sms(self, appeal_id, phone, now):
         with self.connect() as conn:
             result = conn.execute("""UPDATE sms_deliveries SET status='sending',attempts=attempts+1,updated_at=?
                 WHERE appeal_id=? AND phone=? AND status IN ('pending','retry','blocked') AND next_attempt<=?
+                AND NOT EXISTS (SELECT 1 FROM settings WHERE key='sms_enabled' AND value='0')
                 AND EXISTS (SELECT 1 FROM appeals a JOIN employees e ON e.id=a.employee_id
-                    WHERE a.id=sms_deliveries.appeal_id AND e.approved=1 AND sms_deliveries.phone IN (e.phone,e.phone_extra))""",
-                (now, appeal_id, phone, now))
+                    WHERE a.id=sms_deliveries.appeal_id AND a.due_at<=? AND a.completed_at IS NULL AND a.sms_held=0
+                    AND e.approved=1 AND e.telegram_id IS NOT NULL AND sms_deliveries.phone IN (e.phone,e.phone_extra))""",
+                (now, appeal_id, phone, now, now))
             self._aggregate_sms(conn, appeal_id)
             return result.rowcount == 1
 
@@ -381,11 +442,20 @@ class Database:
         with self.connect() as conn:
             return [dict(row) for row in conn.execute("SELECT * FROM sms_deliveries WHERE appeal_id=? ORDER BY phone", (appeal_id,))]
 
-    def claim(self, appeal_id, channel, now):
+    def claim(self, appeal_id, channel, now, *, delivery=None):
         with self.connect() as conn:
-            result = conn.execute("""UPDATE deliveries SET status='sending',attempts=attempts+1,updated_at=?
-                WHERE appeal_id=? AND channel=? AND status IN ('pending','retry','blocked') AND next_attempt<=?""",
-                (now, appeal_id, channel, now))
+            expected = ""
+            values = ()
+            if delivery is not None:
+                expected = "AND e.telegram_id IS ? AND a.client_name=? AND a.phone=? AND a.body=? AND a.source_json=?"
+                values = (delivery["telegram_id"], delivery["client_name"], delivery["client_phone"], delivery["body"], delivery["source_json"])
+            result = conn.execute(f"""UPDATE deliveries SET status='sending',attempts=attempts+1,updated_at=?
+                WHERE appeal_id=? AND channel=? AND status IN ('pending','retry','blocked') AND next_attempt<=?
+                AND (channel!='sms' OR NOT EXISTS (SELECT 1 FROM settings WHERE key='sms_enabled' AND value='0'))
+                AND EXISTS (SELECT 1 FROM appeals a JOIN employees e ON e.id=a.employee_id
+                    WHERE a.id=deliveries.appeal_id AND a.due_at<=? AND a.completed_at IS NULL AND e.approved=1
+                    AND (channel!='sms' OR a.sms_held=0) {expected})""",
+                (now, appeal_id, channel, now, now, *values))
             return result.rowcount == 1
 
     def finish(self, appeal_id, channel, status, error=None, message_id=None, delay=0, refund=False):
@@ -408,7 +478,7 @@ class Database:
             conn.execute("BEGIN IMMEDIATE")
             if not conn.execute("SELECT 1 FROM appeals WHERE id=?", (appeal_id,)).fetchone():
                 raise ValueError("Murojaat topilmadi.")
-            if conn.execute("SELECT 1 FROM deliveries WHERE appeal_id=? AND (attempts>0 OR status IN ('sent','sending','unknown'))", (appeal_id,)).fetchone():
+            if conn.execute("SELECT 1 FROM appeals WHERE id=? AND completed_at IS NOT NULL", (appeal_id,)).fetchone() or conn.execute("SELECT 1 FROM deliveries WHERE appeal_id=? AND (attempts>0 OR status IN ('sent','sending','unknown'))", (appeal_id,)).fetchone():
                 raise ValueError("Yuborish boshlangan; vaqtni o'zgartirib bo'lmaydi.")
             conn.execute("UPDATE appeals SET due_at=?,schedule_source='explicit' WHERE id=?", (due_at, appeal_id))
 
@@ -416,13 +486,32 @@ class Database:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             employee_id = self.resolve_employee(conn, reference)
-            if conn.execute("SELECT 1 FROM deliveries WHERE appeal_id=? AND (attempts>0 OR status IN ('sent','sending','unknown'))", (appeal_id,)).fetchone():
+            if conn.execute("SELECT 1 FROM appeals WHERE id=? AND completed_at IS NOT NULL", (appeal_id,)).fetchone() or conn.execute("SELECT 1 FROM deliveries WHERE appeal_id=? AND (attempts>0 OR status IN ('sent','sending','unknown'))", (appeal_id,)).fetchone():
                 raise ValueError("Yuborish boshlangan; xodimni almashtirib bo'lmaydi.")
             if not conn.execute("UPDATE appeals SET employee_id=?,employee_hint=? WHERE id=?", (employee_id, reference, appeal_id)).rowcount:
                 raise ValueError("Murojaat topilmadi.")
 
     def retry(self, appeal_id, channel):
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM appeals WHERE id=? AND completed_at IS NOT NULL", (appeal_id,)).fetchone():
+                raise ValueError("Bajarilgan murojaat qayta yuborilmaydi.")
+            if channel == 'sms':
+                held = conn.execute("SELECT sms_held FROM appeals WHERE id=?", (appeal_id,)).fetchone()
+                if held and held[0]:
+                    recipients = conn.execute("SELECT 1 FROM sms_deliveries WHERE appeal_id=?", (appeal_id,)).fetchone()
+                    table = 'sms_deliveries' if recipients else 'deliveries'
+                    channel_filter = "" if recipients else "AND channel='sms'"
+                    changed = conn.execute(f"""UPDATE {table}
+                        SET attempts=CASE WHEN status IN ('failed','blocked') THEN 0 ELSE attempts END,
+                            next_attempt=0,last_error=NULL,status='pending'
+                        WHERE appeal_id=? {channel_filter} AND status IN ('pending','retry','failed','blocked')""",
+                        (appeal_id,)).rowcount
+                    if not changed:
+                        raise ValueError("Navbatga qo‘yish mumkin bo‘lgan SMS topilmadi.")
+                    conn.execute("UPDATE appeals SET sms_held=0 WHERE id=?", (appeal_id,))
+                    self._aggregate_sms(conn, appeal_id)
+                    return
             if channel == 'sms' and conn.execute("SELECT 1 FROM sms_deliveries WHERE appeal_id=?", (appeal_id,)).fetchone():
                 changed = conn.execute("""UPDATE sms_deliveries SET status='pending',attempts=0,next_attempt=0,last_error=NULL
                     WHERE appeal_id=? AND status IN ('failed','blocked')""", (appeal_id,)).rowcount
@@ -448,7 +537,7 @@ class Database:
             if not result.rowcount:
                 raise ValueError("Noma'lum holatdagi yuborish topilmadi.")
 
-    def status_text(self):
+    def status_text(self, include_sms=True):
         with self.connect() as conn:
             total = conn.execute("SELECT COUNT(*) FROM appeals").fetchone()[0]
             unscheduled = conn.execute("SELECT COUNT(*) FROM appeals WHERE due_at IS NULL").fetchone()[0]
@@ -457,7 +546,19 @@ class Database:
             rows = conn.execute("SELECT channel,status,COUNT(*) AS n FROM deliveries GROUP BY channel,status").fetchall()
         lines = [f"Jami murojaat: {total}", f"Vaqt belgilanmagan: {unscheduled}", f"Xodim biriktirilmagan: {unassigned}",
                  f"Tasdiqlanmagan xodimlar: {unapproved}"]
+        appeals = self.list_appeals(None)
+        if not include_sms:
+            sent = sum(row['telegram'] == 'sent' for row in appeals)
+            unsent = sum(row['telegram'] != 'sent' and row['completed_at'] is None for row in appeals)
+            completed = sum(row['completed_at'] is not None for row in appeals)
+            return (f'Jami murojaat: {total}\n✅ Yuborilgan: {sent}\n⏳ Yuborilmagan: {unsent}'
+                    f'\nBajarildi: {completed}\nIjro kutilmoqda: {total-completed}')
+        lines += [f"Mos xodim topilmagan murojaatlar: {sum(assignment_problem(r) == 'unassigned' for r in appeals)}",
+                  f"Ulanmagan xodimga biriktirilgan murojaatlar: {sum(assignment_problem(r) == 'unconnected' for r in appeals)}",
+                  f"Bajarildi: {sum(r['completed_at'] is not None for r in appeals)}",
+                  f"Ijro kutilmoqda: {sum(r['completed_at'] is None for r in appeals)}"]
         mode = self.default_schedule()
+        lines.insert(0, 'SMS yuborish: ' + ('yoqilgan' if self.sms_enabled() else 'o‘chirilgan'))
         lines.insert(0, "Avtomatik yuborish: " + ("yuklangach darhol" if mode == "darhol" else f"har kuni {mode}" if mode else "sozlanmagan — /jadval ni tanlang"))
         for channel in ("telegram", "sms"):
             lines.append("\n" + channel.upper() + ":")
@@ -466,11 +567,12 @@ class Database:
         return "\n".join(lines)
 
     def list_appeals(self, timezone, today=False):
+        timezone = TIMEZONE
         now = datetime.now(timezone)
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         with self.connect() as conn:
-            query = """SELECT a.id,a.due_at,COALESCE(e.name,NULLIF(a.employee_hint,'')) AS employee,
-                e.approved AS employee_approved,
+            query = """SELECT a.id,a.due_at,a.employee_id,a.completed_at,a.completed_by,a.sms_held,COALESCE(e.name,NULLIF(a.employee_hint,'')) AS employee,
+                e.approved AS employee_approved,e.telegram_id AS employee_telegram_id,
                 t.status AS telegram,s.status AS sms FROM appeals a
                 LEFT JOIN employees e ON a.employee_id=e.id
                 JOIN deliveries t ON t.appeal_id=a.id AND t.channel='telegram'
@@ -515,8 +617,67 @@ class Database:
 
     def claim_notice(self, key):
         with self.connect() as conn:
-            return conn.execute("UPDATE notices SET status='sending',attempts=attempts+1 WHERE notice_key=? AND status IN ('pending','retry')", (key,)).rowcount == 1
+            return conn.execute("UPDATE notices SET status='sending',attempts=attempts+1,updated_at=? WHERE notice_key=? AND status IN ('pending','retry')", (time.time(), key)).rowcount == 1
 
     def finish_notice(self, key, status, delay=0):
         with self.connect() as conn:
-            conn.execute("UPDATE notices SET status=?,next_attempt=? WHERE notice_key=?", (status, time.time()+delay, key))
+            conn.execute("UPDATE notices SET status=?,next_attempt=?,updated_at=? WHERE notice_key=? AND status='sending'", (status, time.time()+delay, time.time(), key))
+
+    def expire_sending(self, now, timeout=120):
+        with self.connect() as conn:
+            cutoff = now - timeout
+            error = "Yuborish timeouti; natijani qabul qiluvchidan tekshiring."
+            conn.execute("UPDATE deliveries SET status='unknown',last_error=? WHERE status='sending' AND updated_at<=? AND channel='telegram'", (error, cutoff))
+            conn.execute("""UPDATE deliveries SET status='unknown',last_error=? WHERE status='sending' AND updated_at<=?
+                AND channel='sms' AND NOT EXISTS (SELECT 1 FROM sms_deliveries s WHERE s.appeal_id=deliveries.appeal_id)""", (error, cutoff))
+            conn.execute("UPDATE sms_deliveries SET status='unknown',last_error=? WHERE status='sending' AND updated_at<=?", (error, cutoff))
+            conn.execute("UPDATE notices SET status='unknown' WHERE status='sending' AND updated_at<=?", (cutoff,))
+            for row in conn.execute("SELECT DISTINCT appeal_id FROM sms_deliveries WHERE status='unknown'").fetchall():
+                self._aggregate_sms(conn, row[0])
+
+    def disconnect_employee(self, employee_id):
+        with self.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            employee = conn.execute('SELECT * FROM employees WHERE id=?', (employee_id,)).fetchone()
+            if not employee:
+                raise ValueError('Xodim topilmadi.')
+            conn.execute("UPDATE employees SET approved=0,telegram_id=NULL,telegram_ref='phone:'||phone WHERE id=?", (employee_id,))
+            conn.execute("UPDATE join_requests SET status='superseded' WHERE employee_id=? AND status='pending'", (employee_id,))
+            identifiers = [r[0] for r in conn.execute('SELECT id FROM appeals WHERE employee_id=?', (employee_id,))]
+            for identifier in identifiers:
+                conn.execute("UPDATE deliveries SET status='unknown',last_error='Xodim yuborish paytida uzildi' WHERE appeal_id=? AND status='sending'", (identifier,))
+                conn.execute("UPDATE sms_deliveries SET status='unknown',last_error='Xodim yuborish paytida uzildi' WHERE appeal_id=? AND status='sending'", (identifier,))
+            if employee['telegram_id']:
+                conn.execute('INSERT INTO notices(notice_key,admin_id,text) VALUES (?,?,?)',
+                             (f"disconnect:{employee_id}:{time.time_ns()}", employee['telegram_id'],
+                              "Bot bilan ulanishingiz admin tomonidan uzildi. Qayta ulanish uchun Ulanish tugmasini bosing."))
+
+    def complete_appeal(self, identifier, telegram_id, admin_ids):
+        with self.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute("""SELECT a.* FROM appeals a JOIN employees e ON e.id=a.employee_id
+                WHERE a.id=? AND e.telegram_id=? AND e.approved=1 AND a.due_at<=?""", (identifier, telegram_id, time.time())).fetchone()
+            if not row:
+                raise ValueError('Bu murojaat sizga biriktirilmagan yoki vaqti kelmagan.')
+            if row['completed_at'] is not None:
+                return False
+            conn.execute('UPDATE appeals SET completed_at=?,completed_by=? WHERE id=?', (time.time(), telegram_id, identifier))
+            conn.executemany('INSERT OR IGNORE INTO notices(notice_key,admin_id,text) VALUES (?,?,?)',
+                             [(f'completed:{identifier}:{admin_id}', admin_id, f'Murojaat #{identifier}: ✅ Bajarildi.') for admin_id in admin_ids])
+            return True
+
+    @staticmethod
+    def create_backup(source, target):
+        source, target = Path(source), Path(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_suffix('.partial')
+        started = time.monotonic()
+        def progress(status, remaining, total):
+            if time.monotonic() - started > 30:
+                raise TimeoutError('SQLite backup timeout')
+        with closing(sqlite3.connect(source.resolve().as_uri() + '?mode=ro', uri=True, timeout=5)) as origin:
+            with closing(sqlite3.connect(partial, timeout=5)) as destination:
+                origin.backup(destination, pages=128, progress=progress)
+                if destination.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
+                    raise RuntimeError('SQLite backup verification failed')
+        os.replace(partial, target)

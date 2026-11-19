@@ -71,6 +71,204 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(map(len, self.markup().keyboard)), 5)
         self.assertEqual(self.message.reply_text.await_count, 2)
 
+    async def test_sms_switch_is_admin_only_and_visible_in_schedule(self):
+        await ui.start(self.update, self.context)
+        await self.click('schedule')
+        self.assertIn('SMS yuborish: ✅ Yoqilgan', self.last_screen['text'])
+        self.assertIn('sms:off', str(self.markup()))
+        await self.click('sms:off', user=555)
+        self.assertTrue(self.db.sms_enabled())
+        await self.click('sms:off')
+        self.assertFalse(self.db.sms_enabled())
+        self.assertIn('SMS yuborish: ❌ O‘chirilgan', self.last_screen['text'])
+        self.assertIn('sms:on', str(self.markup()))
+        self.assertIn('SMS yuborish: o‘chirilgan', self.db.status_text())
+        await self.click('sms:off')
+        self.assertFalse(self.db.sms_enabled())
+        await self.click('sms:on')
+        self.assertTrue(self.db.sms_enabled())
+        await self.click('sms:invalid')
+        self.assertEqual(self.last_screen['text'], ui.STALE)
+        self.assertTrue(self.db.sms_enabled())
+
+    async def test_settings_keyboard_opens_sms_controls_and_keeps_legacy_shortcut(self):
+        await ui.start(self.update, self.context)
+        labels = [key.text for line in self.markup().keyboard for key in line]
+        self.assertIn('⚙️ Sozlamalar', labels)
+        self.assertNotIn('⚙️ Qo‘shimcha', labels)
+        self.message.text = '⚙️ Sozlamalar'
+        await ui.input_message(self.update, self.context)
+        self.assertIn('⚙️ Sozlamalar', self.last_screen['text'])
+        buttons = [b for line in self.markup().inline_keyboard for b in line]
+        off = next(b for b in buttons if b.text == '❌ SMS o‘chirish')
+        await self.click(off.callback_data.split(':', 2)[2], user=555)
+        self.assertTrue(self.db.sms_enabled())
+        await self.click(off.callback_data.split(':', 2)[2])
+        self.assertFalse(self.db.sms_enabled())
+        self.assertIn('⚙️ Sozlamalar', self.last_screen['text'])
+        self.assertIn('SMS yuborish: ❌ O‘chirilgan', self.last_screen['text'])
+        self.assertIn('sms:on:extra', str(self.markup()))
+        await self.click('sms:on:extra')
+        self.assertTrue(self.db.sms_enabled())
+        await self.click('sms:off:status')
+        self.assertTrue(self.db.sms_enabled())
+        self.assertEqual(self.last_screen['text'], ui.STALE)
+        self.message.text = '⚙️ Qo‘shimcha'
+        await ui.input_message(self.update, self.context)
+        self.assertIn('⚙️ Sozlamalar', self.last_screen['text'])
+        self.assertIn('sms:off:extra', str(self.markup()))
+
+    async def test_missing_applicant_buttons_use_appeal_id_and_open_correct_card(self):
+        for index, name in enumerate(("Ko'rsatilmagan", 'Ko‘rsatilmagan', '')):
+            identifier = f'MISSING-NAME-{index}'
+            row = appeal(identifier, time.time()-10, 'Worker 0')
+            row['client_name'] = name
+            self.db.import_appeals([row])
+        await ui.start(self.update, self.context)
+        await self.click('list:all:0')
+        buttons = [b for line in self.markup().inline_keyboard for b in line]
+        for index in range(3):
+            identifier = f'MISSING-NAME-{index}'
+            button = next(b for b in buttons if f'Murojaat #{identifier}' in b.text)
+            await self.click(button.callback_data.split(':', 2)[2])
+            self.assertIn('Synthetic test only', self.last_screen['text'])
+            number = button.callback_data.rsplit(':', 1)[1]
+            self.assertEqual(ui.appeal_id(self.context, number), identifier)
+        self.assertFalse(any('Ko‘rsatilmagan' in b.text or "Ko'rsatilmagan" in b.text for b in buttons))
+
+    async def test_saved_legacy_sender_appears_in_both_cards_and_list(self):
+        row = appeal('LEGACY-SENDER', time.time()-10, 'Worker 0')
+        row.update(client_name="Ko'rsatilmagan", legacy=True, source_data={'юборган ижрочи': 'Synthetic Sender'})
+        self.db.import_appeals([row])
+        await ui.start(self.update, self.context)
+        await self.click('list:all:0')
+        buttons = [b for line in self.markup().inline_keyboard for b in line]
+        sender = next(b for b in buttons if 'Synthetic Sender' in b.text)
+        route = sender.callback_data.split(':', 2)[2]
+        await self.click(route)
+        self.assertIn('Юборган ижрочи: Synthetic Sender', self.last_screen['text'])
+        await self.click(route.replace('card:', 'own:'), user=1000)
+        self.assertIn('Юборган ижрочи: Synthetic Sender', self.last_screen['text'])
+
+    async def test_sent_telegram_is_not_attention_regardless_of_sms_switch(self):
+        with self.db.connect() as conn:
+            conn.execute("UPDATE deliveries SET status='sent' WHERE channel='telegram'")
+            conn.execute("UPDATE deliveries SET status='failed',attempts=4 WHERE channel='sms'")
+        await ui.start(self.update, self.context)
+        await self.click('status')
+        self.assertIn('E’tibor talab qiladigan murojaatlar: 0', self.last_screen['text'])
+        self.assertNotIn('SMS', self.last_screen['text'])
+        await self.click('sms:off')
+        await self.click('status')
+        self.assertIn('E’tibor talab qiladigan murojaatlar: 0', self.last_screen['text'])
+        self.assertIn('✅ Yuborishda e’tibor talab qiladigan muammo yo‘q.', self.last_screen['text'])
+        self.assertNotIn('list:attention:0', str(self.markup()))
+        await self.click('list:attention:0')
+        self.assertIn('murojaatlar: 0', self.last_screen['text'])
+        await self.click('list:all:0')
+        labels = [b.text for line in self.markup().inline_keyboard for b in line if ':card:' in b.callback_data]
+        self.assertTrue(labels)
+        self.assertTrue(all(label.startswith('✅') for label in labels))
+        await self.click('sms:on')
+        await self.click('status')
+        self.assertIn('E’tibor talab qiladigan murojaatlar: 0', self.last_screen['text'])
+
+    async def test_disabled_sms_preserves_real_telegram_attention_and_pagination(self):
+        with self.db.connect() as conn:
+            conn.execute("UPDATE deliveries SET status='sent' WHERE channel='telegram'")
+            conn.execute("UPDATE deliveries SET status='unknown' WHERE channel='sms'")
+            conn.execute("UPDATE deliveries SET status='failed' WHERE channel='telegram' AND appeal_id IN ('LONG-0','LONG-1','LONG-2','LONG-3','LONG-4','LONG-5')")
+        self.db.set_sms_enabled(False)
+        await ui.start(self.update, self.context)
+        await self.click('status')
+        self.assertIn('E’tibor talab qiladigan murojaatlar: 6', self.last_screen['text'])
+        self.assertIn('Telegram: yuborishda xato: 6 ta', self.last_screen['text'])
+        self.assertNotIn('SMS: yuborish natijasi noma’lum', self.last_screen['text'])
+        await self.click('card:1')
+        self.assertIn('⚠️ E’tibor sababi:\nTelegram: yuborishda xato', self.last_screen['text'])
+        self.assertNotIn('SMS: yuborish natijasi noma’lum', self.last_screen['text'])
+        await self.click('list:attention:0')
+        self.assertIn('murojaatlar: 6', self.last_screen['text'])
+        await self.click('pages:attention:0:list')
+        self.assertIn('list:attention:1', str(self.markup()))
+        await self.click('list:attention:1')
+        self.assertEqual(sum(':card:' in b.callback_data for line in self.markup().inline_keyboard for b in line), 1)
+
+    async def test_sent_card_hides_sms_and_attempts_without_changing_history(self):
+        await ui.start(self.update, self.context)
+        for status in ('pending', 'retry', 'blocked', 'failed', 'unknown', 'sent'):
+            with self.db.connect() as conn:
+                conn.execute("UPDATE deliveries SET status='sent',attempts=1 WHERE channel='telegram' AND appeal_id='LONG-0'")
+                conn.execute("UPDATE deliveries SET status=?,attempts=4 WHERE channel='sms' AND appeal_id='LONG-0'", (status,))
+            before = self.db.details('LONG-0')
+            await self.click('card:1')
+            self.assertIn('Holat: ✅ Yuborildi', self.last_screen['text'])
+            for hidden in ('SMS', 'urinish', 'Urinishlar', 'Kutilmoqda', 'E’tibor sababi'):
+                self.assertNotIn(hidden, self.last_screen['text'])
+            self.assertNotIn('retry:', str(self.markup()))
+            self.assertNotIn('unknown:', str(self.markup()))
+            self.assertEqual(self.db.details('LONG-0'), before)
+
+    async def test_sms_list_has_due_unsent_sms_and_independent_pagination(self):
+        with self.db.connect() as conn:
+            conn.execute("UPDATE deliveries SET status='sent' WHERE channel='telegram' AND appeal_id IN ('LONG-0','LONG-1')")
+            conn.execute("UPDATE deliveries SET status='failed' WHERE channel='sms'")
+            conn.execute("UPDATE deliveries SET status='sent' WHERE channel='sms' AND appeal_id='LONG-2'")
+            conn.execute("UPDATE appeals SET due_at=? WHERE id='LONG-3'", (time.time()+3600,))
+            conn.execute("UPDATE appeals SET due_at=NULL WHERE id='LONG-4'")
+            conn.execute("UPDATE appeals SET completed_at=? WHERE id='LONG-5'", (time.time(),))
+        await ui.start(self.update, self.context)
+        self.assertEqual(len(ui.appeal_rows(self.context, 'sent')), 2)
+        self.assertEqual(len(ui.appeal_rows(self.context, 'unsent')), 13)
+        records = ui.appeal_rows(self.context, 'sms')
+        self.assertEqual(len(records), 13)
+        self.assertTrue({'LONG-0', 'LONG-1', 'LONG-5'}.issubset({row['id'] for row in records}))
+        await self.click('smssettings')
+        self.assertIn('SMSda bormaganlar: 13', self.last_screen['text'])
+        await self.click('sms:off:smssettings')
+        self.assertFalse(self.db.sms_enabled())
+        self.assertIn('SMS sozlamalari', self.last_screen['text'])
+        await self.click('list:sms:0')
+        self.assertIn('SMSda bormaganlar: 13', self.last_screen['text'])
+        self.assertEqual(sum(':smscard:' in b.callback_data for line in self.markup().inline_keyboard for b in line), 5)
+        await self.click('pages:sms:0:list')
+        self.assertIn('list:sms:1', str(self.markup()))
+        await self.click('list:sms:2')
+        self.assertEqual(sum(':smscard:' in b.callback_data for line in self.markup().inline_keyboard for b in line), 3)
+        await self.click('smscard:1', user=555)
+        self.assertTrue(self.update.callback_query.answer.call_args.kwargs['show_alert'])
+
+    async def test_sms_recovery_stays_in_sms_screen_and_preserves_telegram(self):
+        with self.db.connect() as conn:
+            conn.execute("UPDATE employees SET phone_extra='+998900000099' WHERE id=1")
+        self.db.ready_deliveries(time.time())
+        with self.db.connect() as conn:
+            conn.execute("UPDATE deliveries SET status='sent' WHERE channel='telegram' AND appeal_id='LONG-0'")
+            conn.execute("UPDATE sms_deliveries SET status='sent',attempts=1 WHERE appeal_id='LONG-0'")
+            conn.execute("UPDATE sms_deliveries SET status='failed',attempts=4 WHERE appeal_id='LONG-0' AND phone='+998900000099'")
+            self.db._aggregate_sms(conn, 'LONG-0')
+        await ui.start(self.update, self.context)
+        await self.click('smscard:1')
+        self.assertIn('+998900000099', self.last_screen['text'])
+        self.assertIn('urinish: 4', self.last_screen['text'])
+        await self.click('retry:1:sms')
+        await self.click('execute')
+        self.assertIn('SMS — Murojaat #LONG-0', self.last_screen['text'])
+        details = {row['phone']: row for row in self.db.sms_details('LONG-0')}
+        self.assertEqual(details['+998900000099']['status'], 'pending')
+        self.assertEqual(details['+998900000000']['status'], 'sent')
+        with self.db.connect() as conn:
+            conn.execute("UPDATE sms_deliveries SET status='unknown' WHERE appeal_id='LONG-0' AND phone='+998900000099'")
+            self.db._aggregate_sms(conn, 'LONG-0')
+        await self.click('unknown:1:sms')
+        self.assertIn('smscard:1', str(self.markup()))
+        await self.click('confirm:1:sms:yes')
+        self.assertIn('smscard:1', str(self.markup()))
+        await self.click('execute')
+        self.assertIn('Holat: yuborildi', self.last_screen['text'])
+        self.assertNotIn('LONG-0', {row['id'] for row in ui.appeal_rows(self.context, 'sms')})
+        self.assertEqual(next(c for c in self.db.details('LONG-0')[1] if c['channel'] == 'telegram')['status'], 'sent')
+
     async def test_all_generated_buttons_have_dispatch_branches_and_fit_limits(self):
         tree = ast.parse(inspect.getsource(ui.dispatch))
         handled = set()
@@ -83,7 +281,8 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         routes = ['home', 'appeals', 'list:all:0', 'list:all:1', 'list:today:0', 'list:attention:0',
             'pages:all:0:list', 'card:1', 'moretext:1:1', 'staff', 'workers:0', 'workers:1',
             'pages:staff:1:workers', 'worker:1', 'assign:1:0', 'pages:staff:0:assign:1',
-            'joins:0', 'joins:1', 'request:2', 'schedule', 'status', 'extra', 'day:1', 'clock:1:today',
+            'joins:0', 'joins:1', 'request:2', 'schedule', 'status', 'extra', 'smssettings', 'list:sms:0', 'smscard:1',
+            'list:sent:0', 'list:unsent:0', 'day:1', 'clock:1:today',
             'clock:global', 'custom', 'date:1', 'add', 'upload:employees', 'upload:appeals',
             'retry:1:telegram', 'unknown:1:telegram', 'confirm:1:telegram:no', 'reject:2', 'attempts:1', 'appeal',
             'file:templates', 'file:employees', 'file:appeals']
@@ -108,8 +307,10 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         await ui.card(self.update, self.context, '1')
         routes = [b.callback_data.split(':')[2] for line in self.markup().inline_keyboard for b in line]
         self.assertIn('retry', routes)
-        self.assertIn('unknown', routes)
+        self.assertNotIn('unknown', routes)
         self.assertNotIn('send', routes)
+        await ui.sms_card(self.update, self.context, '1')
+        self.assertIn('unknown', [b.callback_data.split(':')[2] for line in self.markup().inline_keyboard for b in line])
 
     async def test_every_admin_route_denied_before_database_access(self):
         await ui.start(self.update, self.context)
@@ -209,6 +410,51 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         await self.click('own:1', user=1001)
         self.assertEqual(self.last_screen['text'], ui.STALE)
 
+    async def test_sms_link_opens_owned_appeal_and_its_full_continuation(self):
+        self.update.effective_user.id = 1000
+        self.context.args = ['task_1']
+        body = 'Synthetic content. ' + '😀' * 3000 + ' Synthetic tail.'
+        with self.db.connect() as conn:
+            conn.execute("UPDATE appeals SET body=? WHERE id='LONG-0'", (body,))
+        await ui.start(self.update, self.context)
+        self.assertIn('Murojaat #LONG-0', self.last_screen['text'])
+        body = self.db.details('LONG-0')[0]['body']
+        size = ui.BODY_PAGE_SIZE
+        self.assertTrue(self.last_screen['text'].endswith(body[:size]))
+        for page in range(1, (len(body)+size-1)//size):
+            await self.click(f'moretext:1:{page}', user=1000)
+            self.assertEqual(self.last_screen['text'], body[page*size:(page+1)*size])
+        await self.click('mine:0', user=1000)
+        self.assertIn('Murojaatingizni tanlang', self.last_screen['text'])
+
+    async def test_sms_link_denies_other_unapproved_future_and_missing_appeals(self):
+        self.context.args = ['task_1']
+        for user in (1001, 555, 987):
+            self.update.effective_user.id = user
+            await ui.start(self.update, self.context)
+            self.assertIn('sizga biriktirilmagan', self.last_screen['text'])
+            self.assertNotIn('Synthetic content.', self.last_screen['text'])
+        self.update.effective_user.id = 1000
+        with self.db.connect() as conn:
+            conn.execute('UPDATE employees SET approved=0 WHERE id=1')
+        await ui.start(self.update, self.context)
+        self.assertIn('sizga biriktirilmagan', self.last_screen['text'])
+        with self.db.connect() as conn:
+            conn.execute('UPDATE employees SET approved=1 WHERE id=1')
+            conn.execute("UPDATE appeals SET due_at=? WHERE id='LONG-0'", (time.time()+3600,))
+        await ui.start(self.update, self.context)
+        self.assertIn('sizga biriktirilmagan', self.last_screen['text'])
+        self.context.args = ['task_9999']
+        await ui.start(self.update, self.context)
+        self.assertIn('sizga biriktirilmagan', self.last_screen['text'])
+
+    async def test_sms_link_rejects_malformed_payloads(self):
+        self.update.effective_user.id = 1000
+        for args in (['task_0'], ['task_-1'], ['task_invalid'], ['task_1', 'extra'], ['task_'+'9'*20]):
+            self.context.args = args
+            await ui.start(self.update, self.context)
+            self.assertIn('havolasi noto‘g‘ri', self.last_screen['text'])
+
     async def test_optional_steps_cancel_and_unknown_resolution(self):
         await ui.start(self.update, self.context)
         await self.click('add')
@@ -267,7 +513,9 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('jami 12 ta', text)
         self.assertIn('Sahifa 2/3', text)
         visible = self.db.employee_list()[5:10]
-        self.assertIn(f"6. {visible[0]['name']}\n\n7. {visible[1]['name']}", text)
+        self.assertIn(f"6. {visible[0]['name']} — ulanmagan\n\n7. {visible[1]['name']} — ulanmagan", text)
+        self.assertIn(f"6. {visible[0]['name']} — ulanmagan",
+                      [b.text for line in self.markup().inline_keyboard for b in line])
         self.assertNotIn('tasdig', text)
         self.assertNotIn('Smena:', text)
         self.assertNotIn(' | ', text)
@@ -275,10 +523,20 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         text = self.last_screen['text']
         self.assertIn(visible[0]['phone'], text)
         self.assertIn('Ulanish:', text)
+        self.assertIn('❌ Ulanmagan', text)
         self.assertIn('workers:1', str(self.markup()))
         from handlers.bot import employees
         await employees(self.update, self.context)
         self.assertIn('Sahifa 1/3', self.last_screen['text'])
+        self.assertIn('1. Worker 0\n\n', self.last_screen['text'])
+        self.assertIn('2. Worker 1 — ulanmagan', self.last_screen['text'])
+        request = next(r for r in self.db.pending_joins() if r['telegram_id'] == 1001)
+        self.db.decide_join(request['id'], True, 987)
+        await self.click('workers:0')
+        self.assertIn('2. Worker 1\n\n', self.last_screen['text'])
+        self.assertIn('2. Worker 1', [b.text for line in self.markup().inline_keyboard for b in line])
+        await self.click('worker:2')
+        self.assertIn('✅ Ulangan', self.last_screen['text'])
 
     async def test_bottom_keyboard_routes_and_questions_follow_typed_answers(self):
         await ui.start(self.update, self.context)
@@ -301,4 +559,62 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
             self.message.text = label
             await ui.input_message(self.update, self.context)
             self.assertIn('faqat adminlar', self.last_screen['text'])
+
+    async def test_status_has_separate_assignment_problem_lists(self):
+        row = appeal('UNCONNECTED', time.time()-10, 'Worker 1')
+        missing = appeal('MISSING', time.time()-10, 'Missing Worker')
+        missing['legacy'] = True
+        self.db.import_appeals([row, missing])
+        await ui.start(self.update, self.context)
+        await self.click('status')
+        actions = [b.callback_data.split(':', 2)[2] for line in self.markup().inline_keyboard for b in line]
+        self.assertIn('list:unconnected:0', actions)
+        self.assertIn('list:unassigned:0', actions)
+        await self.click('list:unconnected:0')
+        self.assertIn('Xodimi ulanmagan murojaatlar: 1', self.last_screen['text'])
+        await self.click('list:unassigned:0')
+        self.assertIn('Mos xodim topilmagan murojaatlar: 1', self.last_screen['text'])
+
+    async def test_legacy_deadline_upload_warns_and_does_not_schedule_from_deadline(self):
+        await ui.start(self.update, self.context)
+        await self.click('upload:appeals')
+        payload = workbook_bytes(['Кириш рақами', 'Аризачи', 'Ҳужжат мазмуни', 'Кимга юборилган', 'Муддати'],
+                                 [['SYNTHETIC/1', 'Synthetic Client', 'Synthetic body', 'Worker 0', '2027-01-01']])
+        self.message.document = SimpleNamespace(file_name='synthetic.xlsx', file_size=len(payload), get_file=AsyncMock(
+            return_value=SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(payload)))))
+        await ui.input_message(self.update, self.context)
+        self.assertIn('Муддати', self.last_screen['text'])
+        self.assertIn('yuborish vaqti sifatida olinmadi', self.last_screen['text'])
+        row = next(r for r in self.db.export_appeals() if r['legacy'])
+        self.assertIsNone(row['due_at'])
+
+    async def test_disconnect_requires_admin_confirmation_and_approval_notifies_worker(self):
+        await ui.start(self.update, self.context)
+        await self.click('disconnect:1', user=555)
+        self.assertTrue(self.db.employee_list()[0]['approved'])
+        await self.click('worker:1')
+        await self.click('disconnect:1')
+        self.assertTrue(next(r for r in self.db.employee_list() if r['id'] == 1)['approved'])
+        await self.click('execute')
+        self.assertFalse(next(r for r in self.db.employee_list() if r['id'] == 1)['approved'])
+        self.assertIn('❌ Ulanmagan', self.last_screen['text'])
+        await self.click('approve:2')
+        notices = self.db.ready_notices(time.time())
+        self.assertTrue(any(r['admin_id'] == 1001 and 'tasdiqlandi' in r['text'] for r in notices))
+        self.assertTrue(any(r['admin_id'] == 1000 and 'uzildi' in r['text'] for r in notices))
+
+    async def test_done_button_is_owned_and_visible_to_admin(self):
+        await ui.start(self.update, self.context)
+        await self.click('own:1', user=1000)
+        self.assertIn('✅ Bajarildi', [b.text for line in self.markup().inline_keyboard for b in line])
+        await self.click('done:1', user=1001)
+        self.assertIsNone(self.db.details('LONG-0')[0]['completed_at'])
+        await self.click('own:1', user=1000)
+        await self.click('done:1', user=1000)
+        self.assertIn('Ijro: ✅ Bajarildi', self.last_screen['text'])
+        self.assertNotIn('✅ Bajarildi', [b.text for line in self.markup().inline_keyboard for b in line])
+        await self.click('card:1')
+        self.assertIn('Ijro: ✅ Bajarildi', self.last_screen['text'])
+        await self.click('list:completed:0')
+        self.assertIn('Bajarilgan murojaatlar: 1', self.last_screen['text'])
 

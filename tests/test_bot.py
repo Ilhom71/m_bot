@@ -1,6 +1,8 @@
 """Integration tests use synthetic data and never send real messages."""
 import asyncio
 import json
+import logging
+import os
 import sqlite3
 import subprocess
 import sys
@@ -8,6 +10,7 @@ import tempfile
 import time
 import unittest
 from dataclasses import replace
+from contextlib import closing
 from zipfile import ZipFile
 from xml.etree import ElementTree
 from datetime import datetime
@@ -17,15 +20,17 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
+import httpx
+import sms
 from openpyxl import Workbook, load_workbook
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut
 
-from config import Settings
+from config import Settings, load_demo_settings, load_settings
 from db import Database
 from excel_utils import ValidationError, appeals_workbook, build_workbook, in_shift, parse_excel, phone_number
 from handlers.bot import (ADMIN_MENU, USER_MENU, BUTTON_ACTIONS, automatic_schedule, send_now, command_actions, document, export_employees,
                           join_callback, join_contact, my_appeals, new_appeal, status, text_message, templates)
-from main import InstanceLock
+from main import InstanceLock, RedactingFormatter, build_application
 from scheduler import DeliveryService
 from sms import SMSNotConfigured, SMSRetryableError
 
@@ -211,7 +216,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.db.import_employees([employee()])
         request_id = self.db.request_join(1, 123456789)
         self.db.decide_join(request_id, True, 987)
-        self.bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=42)),
+        self.bot = SimpleNamespace(username="synthetic_test_bot", send_message=AsyncMock(return_value=SimpleNamespace(message_id=42)),
                                    send_document=AsyncMock(return_value=SimpleNamespace(message_id=43)))
         self.sms = AsyncMock(return_value="provider-test-id")
         self.service = DeliveryService(self.bot, self.db, self.settings, self.sms)
@@ -224,6 +229,58 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
     def channel(self, channel="telegram", appeal_id="TEST-1"):
         return next(row for row in self.db.details(appeal_id)[1] if row["channel"] == channel)
+
+    async def test_legacy_sender_without_applicant_appears_in_telegram(self):
+        payload = workbook_bytes(
+            ['Кириш рақами', 'Ҳужжат мазмуни', 'Кимга юборилган', 'Юборган   ижрочи'],
+            [['SYNTHETIC-1', 'Synthetic text', 'Test Worker', 'Synthetic Sender']],
+        )
+        rows = parse_excel(payload, 'appeals', TZ)
+        self.assertEqual(rows[0]['employee_ref'], 'Test Worker')
+        self.db.import_appeals(rows)
+        self.db.set_time(rows[0]['id'], time.time()-10)
+        await self.service.tick()
+        message = self.bot.send_message.await_args.kwargs['text']
+        self.assertIn('Юборган ижрочи: Synthetic Sender', message)
+        self.assertNotIn('Mijoz:', message)
+
+    async def test_demo_starts_empty_with_separate_database_and_no_sms_transport(self):
+        with patch('config.ROOT', self.settings.database.parent), patch.dict(os.environ, {
+                'DEMO_BOT_TOKEN': '123:synthetic-demo', 'DEMO_ADMIN_ID': '987'}, clear=True), \
+                patch('config.load_dotenv') as dotenv_reader, patch('config.dotenv_values') as dotenv_values_reader:
+            settings = load_demo_settings()
+        dotenv_reader.assert_not_called()
+        dotenv_values_reader.assert_not_called()
+        app = build_application(settings)
+        self.assertNotEqual(settings.database, self.settings.database)
+        self.assertEqual(app.bot_data['db'].employee_list(), [])
+        self.assertEqual(app.bot_data['db'].list_appeals(TZ), [])
+        with self.assertRaises(SMSNotConfigured):
+            await app.bot_data['service'].sms_sender('+998900000001', 'Synthetic')
+
+    async def test_fetched_deliveries_respect_rescheduled_time_and_edits(self):
+        self.add_due()
+        telegram, sms_item = self.db.ready_deliveries(time.time())
+        future = time.time() + 3600
+        self.db.set_time('TEST-1', future)
+        await self.service.deliver(telegram)
+        await self.service.deliver(sms_item)
+        self.bot.send_message.assert_not_awaited()
+        self.sms.assert_not_awaited()
+
+        edited = dict(appeal(due=time.time()-10), body='Edited synthetic text')
+        self.db.import_appeals([edited])
+        await self.service.deliver(telegram)
+        self.bot.send_message.assert_not_awaited()
+        await self.service.tick()
+        self.assertIn('Edited synthetic text', self.bot.send_message.await_args.kwargs['text'])
+
+    async def test_sms_queue_scan_keeps_unchanged_confirmation_snapshot(self):
+        self.add_due()
+        self.db.ready_deliveries(time.time())
+        before = self.db.details('TEST-1')
+        self.db.ready_deliveries(time.time())
+        self.assertEqual(self.db.details('TEST-1'), before)
 
     async def test_send_once_across_restarts_and_reimport(self):
         item = appeal(due=time.time()-10)
@@ -244,6 +301,140 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.channel("sms")["status"], "blocked")
         self.assertEqual(self.channel("sms")["attempts"], 0)
 
+    async def test_sms_switch_holds_old_sms_and_keeps_future_schedule(self):
+        self.db.import_employees([dict(employee(), phone_extra='+998900000003')])
+        self.db.decide_join(self.db.request_join(1, 123456789), True, 987)
+        self.add_due()
+        self.db.set_sms_enabled(False)
+        restarted_db = Database(self.settings.database)
+        restarted = DeliveryService(self.bot, restarted_db, self.settings, self.sms)
+        self.assertFalse(restarted_db.sms_enabled())
+        await restarted.tick()
+        self.bot.send_message.assert_awaited_once()
+        self.sms.assert_not_awaited()
+        self.assertEqual(self.channel('sms')['attempts'], 0)
+        self.assertEqual(self.channel()['status'], 'sent')
+        restarted_db.set_sms_enabled(True)
+        restarted_db.set_sms_enabled(True)
+        restarted_db = Database(self.settings.database)
+        restarted = DeliveryService(self.bot, restarted_db, self.settings, self.sms)
+        await restarted.tick()
+        self.sms.assert_not_awaited()
+        self.bot.send_message.assert_awaited_once()
+
+        due_at = time.time() + 60
+        self.db.import_appeals([appeal('FUTURE', due_at)])
+        self.db.set_sms_enabled(False)
+        self.db.set_sms_enabled(True)
+        with patch('time.time', return_value=due_at + 1):
+            await restarted.tick()
+        self.assertEqual(self.channel('sms', 'FUTURE')['status'], 'sent')
+        self.assertEqual(self.channel('sms')['status'], 'pending')
+        self.assertEqual(self.sms.await_count, 2)
+
+        restarted_db.retry('TEST-1', 'sms')
+        await restarted.tick()
+        self.assertEqual(self.sms.await_count, 4)
+        self.assertEqual({call.args[0] for call in self.sms.await_args_list}, {'+998900000001', '+998900000003'})
+        await restarted.tick()
+        self.assertEqual(self.sms.await_count, 4)
+        self.assertEqual(self.bot.send_message.await_count, 2)
+
+    async def test_disabling_sms_blocks_previously_fetched_deliveries(self):
+        self.add_due()
+        self.assertTrue(self.db.sms_enabled())
+        sms_item = next(item for item in self.db.ready_deliveries(time.time()) if item['channel'] == 'sms')
+        self.db.set_sms_enabled(False)
+        await self.service.deliver(sms_item)
+        self.sms.assert_not_awaited()
+        self.assertEqual(self.db.sms_details('TEST-1')[0]['attempts'], 0)
+        self.assertFalse(self.db.claim('TEST-1', 'sms', time.time()))
+        self.db.set_sms_enabled(True)
+        await self.service.deliver(sms_item)
+        self.sms.assert_not_awaited()
+        await self.service.tick()
+        self.sms.assert_not_awaited()
+
+    async def test_upgrade_holds_backlog_when_sms_was_already_enabled(self):
+        self.add_due()
+        self.db.set_sms_enabled(True)
+        with self.db.connect() as conn:
+            conn.execute("ALTER TABLE appeals DROP COLUMN sms_held")
+
+        upgraded_db = Database(self.settings.database)
+        upgraded = DeliveryService(self.bot, upgraded_db, self.settings, self.sms)
+        await upgraded.tick()
+        self.sms.assert_not_awaited()
+        self.assertEqual(self.channel()['status'], 'sent')
+
+    async def test_disabled_sms_does_not_generate_pending_sms_reminders(self):
+        self.add_due()
+        self.db.set_sms_enabled(False)
+        await self.service.tick()
+        settings = replace(self.settings, admin_ids=frozenset({987}), reminder_hour=0)
+        service = DeliveryService(self.bot, self.db, settings, self.sms)
+        service.prepare_reminders()
+        notices = self.db.ready_notices(time.time())
+        self.assertFalse(any(row['notice_key'].startswith('attention:') for row in notices))
+        self.db.set_sms_enabled(True)
+        service.prepare_reminders()
+        self.assertFalse(any(row['notice_key'].startswith('attention:') for row in self.db.ready_notices(time.time())))
+
+    async def test_sms_is_short_and_links_to_the_assigned_appeal(self):
+        item = appeal("LONG.SYNTHETIC-ID", time.time()-10)
+        item['body'] = 'Synthetic long appeal content. ' * 1000
+        self.db.import_appeals([item])
+        await self.service.tick()
+        phone, text = self.sms.await_args.args
+        self.assertEqual(phone, '+998900000001')
+        self.assertEqual(text, 'Sizga yangi vazifa biriktirildi. Batafsil: '
+                         'https://t.me/synthetic_test_bot?start=task_1')
+        self.assertTrue(text.isascii())
+        self.assertLessEqual(len(text), 160)
+        self.assertNotIn(item['client_name'], text)
+        self.assertNotIn(item['phone'], text)
+        self.assertNotIn('Synthetic long appeal content.', text)
+        parts = [call.kwargs['text'] for call in self.bot.send_message.await_args_list]
+        self.assertGreater(len(parts), 1)
+        content = [part.split('\n', 1)[1] for part in parts]
+        content[0] = content[0].split('\n\n', 1)[1]
+        self.assertEqual(''.join(''.join(content).split()), ''.join(item['body'].split()))
+
+    async def test_textup_results_are_persisted_without_repeating_sms(self):
+        cases = [(httpx.Response(200, json={'smsId': 'synthetic-sms-id'}), 'sent'),
+                 (httpx.Response(400, text='private-provider-response'), 'failed'),
+                 (httpx.Response(500, text='private-provider-response'), 'unknown'),
+                 (httpx.ReadTimeout('private-transport-error'), 'unknown'),
+                 (httpx.Response(401), 'blocked')]
+        for index, (response, expected) in enumerate(cases):
+            with self.subTest(status=expected, index=index):
+                requests = []
+                login = httpx.Response(200, json={'accessToken': 'synthetic-token',
+                    'user': {'id': '00000000-0000-4000-8000-000000000001'}})
+                responses = [response] if expected == 'blocked' else [login, response]
+                def handle(request):
+                    requests.append(request)
+                    result = responses.pop(0)
+                    if isinstance(result, Exception):
+                        raise result
+                    return result
+                provider = sms.TextUPClient('synthetic@example.invalid', 'synthetic-password',
+                                            transport=httpx.MockTransport(handle))
+                self.service.sms_sender = provider.send
+                identifier = f'TEXTUP-{index}'
+                self.add_due(identifier)
+                await self.service.tick()
+                result = self.db.sms_details(identifier)[0]
+                self.assertEqual(result['status'], expected)
+                self.assertEqual(result['attempts'], 0 if expected == 'blocked' else 1)
+                self.assertNotIn('private-', result['last_error'] or '')
+                if expected == 'sent':
+                    self.assertEqual(result['message_id'], 'synthetic-sms-id')
+                self.assertEqual(self.channel('telegram', identifier)['status'], 'sent')
+                request_count = len(requests)
+                await self.service.tick()
+                self.assertEqual(len(requests), request_count)
+
     async def test_initial_attempt_plus_three_retries(self):
         self.add_due()
         self.bot.send_message.side_effect = Forbidden("synthetic rejection")
@@ -255,6 +446,162 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.channel()["attempts"], 4)
         self.assertEqual(self.channel()["status"], "failed")
         self.assertEqual(self.sms.await_count, 1)
+
+    async def test_assignment_warnings_have_distinct_reasons_and_do_not_repeat(self):
+        settings = replace(self.settings, admin_ids=frozenset({987}))
+        service = DeliveryService(self.bot, self.db, settings, self.sms)
+        self.db.import_employees([employee('Pending Worker', '222', '+998900000003')])
+        missing = appeal('MISSING', time.time()-10, 'Missing Worker')
+        missing['legacy'] = True
+        self.db.import_appeals([appeal('PENDING', time.time()-10, 'Pending Worker'), missing])
+        service.prepare_reminders()
+        service.prepare_reminders()
+        notices = [r for r in self.db.ready_notices(time.time()) if r['notice_key'].startswith('assignment:')]
+        self.assertEqual(len(notices), 2)
+        text = '\n'.join(r['text'] for r in notices)
+        self.assertIn('botga ulanmagan', text)
+        self.assertIn('Mos xodim topilmadi', text)
+        self.assertIn('Ulanmagan xodimga biriktirilgan murojaatlar: 1', self.db.status_text())
+        self.assertIn('Mos xodim topilmagan murojaatlar: 1', self.db.status_text())
+
+    async def test_delivery_timeouts_stop_hangs_and_never_resend_unknown(self):
+        async def hanging_send(*args, **kwargs):
+            await asyncio.Future()
+        self.add_due()
+        self.bot.send_message.side_effect = hanging_send
+        with patch('scheduler.SEND_TIMEOUT', 0.01):
+            await self.service.tick()
+        self.assertEqual(self.channel()['status'], 'unknown')
+        self.assertEqual(self.channel('sms')['status'], 'sent')
+        await self.service.tick()
+        self.assertEqual(self.bot.send_message.await_count, 1)
+        self.bot.send_message.side_effect = None
+        self.sms.side_effect = hanging_send
+        self.add_due('SMS-TIMEOUT')
+        with patch('scheduler.SEND_TIMEOUT', 0.01):
+            await self.service.tick()
+        self.assertEqual(self.channel('sms', 'SMS-TIMEOUT')['status'], 'unknown')
+        await self.service.tick()
+        self.assertEqual(self.sms.await_count, 2)
+
+    async def test_stale_sending_watchdog_preserves_fresh_claims(self):
+        self.add_due()
+        self.add_due('FRESH')
+        now = time.time()
+        self.db.ready_deliveries(now)
+        self.assertTrue(self.db.claim('TEST-1', 'telegram', now))
+        self.assertTrue(self.db.claim_sms('TEST-1', '+998900000001', now))
+        self.assertTrue(self.db.claim('FRESH', 'telegram', now))
+        self.db.enqueue_notice('stale-notice', [987], 'Synthetic notice')
+        self.db.claim_notice('stale-notice:987')
+        with self.db.connect() as conn:
+            conn.execute("UPDATE deliveries SET updated_at=? WHERE appeal_id='TEST-1'", (now-121,))
+            conn.execute("UPDATE sms_deliveries SET updated_at=? WHERE appeal_id='TEST-1'", (now-121,))
+            conn.execute("UPDATE notices SET updated_at=? WHERE status='sending'", (now-121,))
+        self.db.expire_sending(now)
+        self.assertEqual(self.channel()['status'], 'unknown')
+        self.assertEqual(self.channel('sms')['status'], 'unknown')
+        self.assertEqual(self.channel(appeal_id='FRESH')['status'], 'sending')
+        with self.db.connect() as conn:
+            self.assertEqual(conn.execute('SELECT status FROM notices').fetchone()[0], 'unknown')
+
+    async def test_duplicate_id_error_is_explicit_and_import_is_atomic(self):
+        first, second = appeal('DUPLICATE'), appeal('DUPLICATE')
+        second['row_number'] = 3
+        with self.assertRaises(ValidationError) as caught:
+            self.db.import_appeals([first, second])
+        self.assertIn("ID 'DUPLICATE'", str(caught.exception))
+        self.assertIn('3-qator', str(caught.exception))
+        self.assertIsNone(self.db.details('DUPLICATE'))
+        self.add_due()
+        await self.service.tick()
+        changed = appeal()
+        changed['body'] = 'Changed synthetic text'
+        with self.assertRaises(ValidationError) as caught:
+            self.db.import_appeals([appeal('NEW-ROLLBACK'), changed])
+        self.assertIn("ID 'TEST-1' mavjud", str(caught.exception))
+        self.assertIn('Yangi murojaatga yangi ID', str(caught.exception))
+        self.assertIsNone(self.db.details('NEW-ROLLBACK'))
+
+    async def test_telegram_alias_and_numeric_id_cannot_share_employees(self):
+        self.db.register_user(123456789, 'syntheticworker')
+        with self.assertRaises(ValidationError):
+            self.db.import_employees([employee('Other', '@syntheticworker', '+998900000003')])
+        self.db.import_employees([employee('Other', '222', '+998900000003')])
+        with self.assertRaises(ValueError):
+            self.db.request_join(2, 123456789)
+
+    async def test_completion_is_owned_idempotent_and_notifies_admin(self):
+        self.add_due()
+        with self.assertRaises(ValueError):
+            self.db.complete_appeal('TEST-1', 555, [987])
+        self.assertTrue(self.db.complete_appeal('TEST-1', 123456789, [987]))
+        completed_at = self.db.details('TEST-1')[0]['completed_at']
+        self.assertFalse(self.db.complete_appeal('TEST-1', 123456789, [987]))
+        self.assertEqual(self.db.details('TEST-1')[0]['completed_at'], completed_at)
+        self.assertEqual(len(self.db.ready_notices(time.time())), 1)
+        self.assertIn('Bajarildi: 1', self.db.status_text())
+        await self.service.tick()
+        self.sms.assert_not_awaited()
+        self.bot.send_message.assert_awaited_once()
+        self.assertEqual(self.bot.send_message.await_args.kwargs['chat_id'], 987)
+        self.assertIn('Bajarildi', self.bot.send_message.await_args.kwargs['text'])
+        with self.assertRaises(ValueError):
+            self.db.retry('TEST-1', 'telegram')
+        self.db.import_appeals([appeal('FUTURE-COMPLETION', time.time()+3600)])
+        with self.assertRaises(ValueError):
+            self.db.complete_appeal('FUTURE-COMPLETION', 123456789, [987])
+
+    async def test_disconnect_revokes_access_and_allows_verified_rejoin(self):
+        self.add_due()
+        self.db.disconnect_employee(1)
+        worker = self.db.employee_list()[0]
+        self.assertEqual(worker['approved'], 0)
+        self.assertIsNone(worker['telegram_id'])
+        self.assertEqual(self.db.export_appeals(telegram_id=123456789), [])
+        self.assertEqual(self.db.ready_deliveries(time.time()), [])
+        notices = self.db.ready_notices(time.time())
+        self.assertEqual(notices[0]['admin_id'], 123456789)
+        request = self.db.join_by_phone('90 000 00 01', 123456789)
+        self.db.decide_join(request, True, 987)
+        self.assertEqual(self.db.employee_list()[0]['approved'], 1)
+
+    async def test_daily_sqlite_backups_include_wal_and_scheduler_database(self):
+        self.add_due()
+        with closing(sqlite3.connect(self.settings.jobs_database)) as conn:
+            conn.execute('CREATE TABLE synthetic_jobs(value TEXT)')
+            conn.execute("INSERT INTO synthetic_jobs VALUES ('persisted')")
+            conn.commit()
+        now = datetime(2027, 1, 1, 23, 55, tzinfo=TZ).timestamp()
+        with self.db.connect() as conn:
+            conn.execute('CREATE TABLE synthetic_wal(value TEXT)')
+            conn.execute("INSERT INTO synthetic_wal VALUES ('committed WAL record')")
+            conn.commit()
+            self.service.backup_databases(now)
+        files = sorted((self.settings.database.parent/'backups').glob('*.sqlite3'))
+        self.assertEqual(len(files), 2)
+        self.assertIn('2027-01-01', files[0].name)
+        with closing(sqlite3.connect(files[0])) as conn:
+            self.assertEqual(conn.execute('PRAGMA quick_check').fetchone()[0], 'ok')
+            self.assertEqual(conn.execute('SELECT value FROM synthetic_wal').fetchone()[0], 'committed WAL record')
+        with closing(sqlite3.connect(files[1])) as conn:
+            self.assertEqual(conn.execute('SELECT value FROM synthetic_jobs').fetchone()[0], 'persisted')
+        original = [path.read_bytes() for path in files]
+        self.service.backup_databases(now+60)
+        self.assertEqual([path.read_bytes() for path in files], original)
+        self.service.backup_databases(now+600)
+        self.assertEqual(len(list(files[0].parent.glob('*.sqlite3'))), 4)
+
+    async def test_backup_failure_does_not_prevent_delivery(self):
+        service = DeliveryService(self.bot, self.db, replace(self.settings, admin_ids=frozenset({987})), self.sms)
+        self.add_due()
+        with patch.object(Database, 'create_backup', side_effect=OSError('synthetic-private-error')):
+            await service.tick()
+        self.assertEqual(self.channel()['status'], 'sent')
+        self.assertEqual(self.channel('sms')['status'], 'sent')
+        notices = self.db.ready_notices(time.time())
+        self.assertTrue(any('backup' in r['text'] for r in notices))
+        self.assertFalse(any('synthetic-private-error' in r['text'] for r in notices))
 
     async def test_network_ambiguity_not_blindly_retried(self):
         self.add_due()
@@ -779,6 +1126,189 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             self.db.set_default_schedule("25:00", TZ)
         self.assertIsNone(self.db.default_schedule())
+
+
+class ConfigurationSecurityTests(unittest.TestCase):
+    def test_admin_ids_come_only_from_dotenv_without_interpolation(self):
+        environment = {'BOT_TOKEN': '123:synthetic', 'ADMIN_IDS': '555', 'TIMEZONE': 'UTC'}
+        with patch.dict(os.environ, environment, clear=True), patch('config.load_dotenv'), \
+                patch('config.dotenv_values', return_value={'ADMIN_IDS': '987, 654'}) as read_config:
+            settings = load_settings()
+            self.assertEqual(settings.admin_ids, frozenset({987, 654}))
+            self.assertEqual(settings.timezone.key, 'Asia/Tashkent')
+            self.assertFalse(read_config.call_args.kwargs['interpolate'])
+        with patch.dict(os.environ, environment, clear=True), patch('config.load_dotenv'), \
+                patch('config.dotenv_values', return_value={}):
+            self.assertEqual(load_settings().admin_ids, frozenset())
+        with patch.dict(os.environ, environment, clear=True), patch('config.load_dotenv'), \
+                patch('config.dotenv_values', return_value={'ADMIN_IDS': '${ADMIN_IDS}'}):
+            with self.assertRaises(ValueError):
+                load_settings()
+
+    def test_imported_and_displayed_times_always_use_tashkent(self):
+        from excel_utils import parse_datetime
+        utc = ZoneInfo('UTC')
+        settings = Settings('123:synthetic', frozenset(), utc)
+        self.assertEqual(settings.timezone.key, 'Asia/Tashkent')
+        moment = parse_datetime(datetime(2027, 1, 1, 9, tzinfo=utc), utc)
+        self.assertEqual(moment.hour, 14)
+        self.assertEqual(moment.tzinfo.key, 'Asia/Tashkent')
+        naive = parse_datetime('2027-01-01 09:00', utc)
+        self.assertEqual(naive.hour, 9)
+        self.assertEqual(naive.utcoffset().total_seconds(), 18000)
+
+    def test_log_formatter_redacts_secrets_in_messages_and_tracebacks(self):
+        token = '123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcde'
+        password = 'synthetic-password-secret'
+        message = ('https://api.telegram.org/bot' + token + '/sendMessage '
+                   'Bearer synthetic-access-secret {"password": "hidden-password", '
+                   '"accessToken": "eyJhbGciOiJIUzI1NiJ9.synthetic.signature"}')
+        try:
+            raise RuntimeError(password)
+        except RuntimeError:
+            record = logging.LogRecord('synthetic', logging.ERROR, '', 0, message, (), sys.exc_info())
+        record.created = datetime(2027, 1, 1, 0, tzinfo=ZoneInfo('UTC')).timestamp()
+        with patch.dict(os.environ, {'BOT_TOKEN': token, 'TEXTUP_PASSWORD': password}):
+            rendered = RedactingFormatter('%(asctime)s %(message)s').format(record)
+        for secret in (token, password, 'synthetic-access-secret', 'hidden-password', 'eyJhbGciOiJIUzI1NiJ9.synthetic.signature'):
+            self.assertNotIn(secret, rendered)
+        self.assertIn('2027-01-01 05:00:00+0500', rendered)
+        self.assertNotIn(token, repr(Settings(token, frozenset(), TZ)))
+
+
+class TextUPTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.requests = []
+        self.responses = []
+        self.provider = sms.TextUPClient('synthetic@example.invalid', 'synthetic-password',
+                                        transport=httpx.MockTransport(self.handle))
+
+    def handle(self, request):
+        self.requests.append(request)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def login_response(self, token='synthetic-access-token'):
+        return httpx.Response(200, json={'accessToken': token, 'refreshToken': 'unused-refresh',
+                                       'user': {'id': '00000000-0000-4000-8000-000000000001'}})
+
+    async def test_login_send_and_cached_token_use_documented_contract(self):
+        self.responses = [self.login_response(), httpx.Response(200, json={'smsId': 'synthetic-sms-1'}),
+                          httpx.Response(200, json={'smsId': 'synthetic-sms-2'})]
+        text = sms.task_notification('synthetic_test_bot', 1)
+        self.assertEqual(await self.provider.send('90 000 00 01', text), 'synthetic-sms-1')
+        self.assertEqual(await self.provider.send('+998900000001', text), 'synthetic-sms-2')
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(str(self.requests[0].url), 'https://api-auth.textup.uz/v1/login')
+        self.assertEqual(json.loads(self.requests[0].content),
+                         {'email': 'synthetic@example.invalid', 'password': 'synthetic-password'})
+        request = self.requests[1]
+        self.assertEqual(str(request.url), 'https://sms-api.textup.uz/v1/send')
+        self.assertEqual(request.method, 'POST')
+        self.assertEqual(request.headers['Authorization'], 'Bearer synthetic-access-token')
+        self.assertEqual(request.headers['Content-Type'], 'application/json')
+        self.assertEqual(json.loads(request.content), {'message': text,
+            'userId': '00000000-0000-4000-8000-000000000001', 'name': 'Task notification',
+            'recipients': ['+998900000001']})
+
+    async def test_optional_template_and_nickname_without_group(self):
+        self.provider = sms.TextUPClient('synthetic@example.invalid', 'synthetic-password',
+            'synthetic-template', 'synthetic-nickname', transport=httpx.MockTransport(self.handle))
+        self.responses = [self.login_response(), httpx.Response(200, json={'smsId': 'synthetic-sms'})]
+        await self.provider.send('+998900000001', 'Synthetic notification')
+        payload = json.loads(self.requests[1].content)
+        self.assertEqual(payload['templateId'], 'synthetic-template')
+        self.assertEqual(payload['nicknameId'], 'synthetic-nickname')
+        self.assertNotIn('groupId', payload)
+
+    async def test_expired_token_logs_in_again_once(self):
+        self.responses = [self.login_response(), httpx.Response(401), self.login_response('new-token'),
+                          httpx.Response(200, json={'smsId': 'synthetic-sms'})]
+        self.assertEqual(await self.provider.send('+998900000001', 'Synthetic notification'), 'synthetic-sms')
+        self.assertEqual(len(self.requests), 4)
+        self.assertEqual(self.requests[-1].headers['Authorization'], 'Bearer new-token')
+        self.assertEqual(json.loads(self.requests[1].content), json.loads(self.requests[-1].content))
+
+    async def test_repeated_unauthorized_does_not_loop(self):
+        self.responses = [self.login_response(), httpx.Response(401), self.login_response('new-token'),
+                          httpx.Response(401)]
+        with self.assertRaises(SMSNotConfigured):
+            await self.provider.send('+998900000001', 'Synthetic notification')
+        self.assertEqual(len(self.requests), 4)
+
+    async def test_login_failures_are_safe_and_do_not_send(self):
+        cases = [(httpx.Response(status, text='private-provider-response'), expected)
+                 for status, expected in ((400, SMSNotConfigured), (401, SMSNotConfigured),
+                     (403, SMSNotConfigured), (429, SMSRetryableError), (500, SMSRetryableError))]
+        cases += [(httpx.Response(200, json={'accessToken': 'secret-token', 'user': {}}), SMSRetryableError),
+                  (httpx.Response(200, text='invalid-json'), SMSRetryableError),
+                  (httpx.ReadTimeout('private-transport-error'), SMSRetryableError)]
+        for response, expected in cases:
+            with self.subTest(response=type(response).__name__, expected=expected.__name__):
+                self.requests = []
+                self.responses = [response]
+                with self.assertRaises(expected) as caught:
+                    await self.provider.send('+998900000001', 'Synthetic notification')
+                self.assertEqual(len(self.requests), 1)
+                self.assertNotIn('private-', str(caught.exception))
+                self.assertNotIn('secret-token', str(caught.exception))
+                self.assertNotIn('synthetic-password', str(caught.exception))
+
+    async def test_send_statuses_distinguish_rejection_retry_and_uncertainty(self):
+        cases = [(httpx.Response(status, text='private-provider-response'), expected)
+                 for status, expected in ((400, sms.SMSRejectedError), (403, sms.SMSRejectedError),
+                     (422, sms.SMSRejectedError), (429, SMSRetryableError),
+                     (408, sms.SMSDeliveryUnknown), (500, sms.SMSDeliveryUnknown),
+                     (502, sms.SMSDeliveryUnknown), (302, sms.SMSDeliveryUnknown))]
+        cases += [(httpx.Response(200, json=payload), sms.SMSDeliveryUnknown)
+                  for payload in ({}, {'smsId': ''}, {'smsId': None}, {'smsId': 123}, [])]
+        cases += [(httpx.Response(200, text='invalid-json'), sms.SMSDeliveryUnknown)]
+        for response, expected in cases:
+            with self.subTest(response=response.status_code, expected=expected.__name__):
+                self.responses = [response]
+                if not self.provider._access_token:
+                    self.responses.insert(0, self.login_response())
+                with self.assertRaises(expected) as caught:
+                    await self.provider.send('+998900000001', 'Synthetic notification')
+                self.assertNotIn('private-provider-response', str(caught.exception))
+                self.assertEqual(self.responses, [])
+
+    async def test_send_transport_failure_does_not_blindly_retry(self):
+        cases = [(httpx.ConnectError, SMSRetryableError), (httpx.ConnectTimeout, SMSRetryableError),
+                 (httpx.PoolTimeout, SMSRetryableError), (httpx.ReadTimeout, sms.SMSDeliveryUnknown),
+                 (httpx.WriteTimeout, sms.SMSDeliveryUnknown), (httpx.WriteError, sms.SMSDeliveryUnknown),
+                 (httpx.RemoteProtocolError, sms.SMSDeliveryUnknown)]
+        for error, expected in cases:
+            with self.subTest(error=error.__name__):
+                self.responses = [error('private-transport-error')]
+                if not self.provider._access_token:
+                    self.responses.insert(0, self.login_response())
+                with self.assertRaises(expected) as caught:
+                    await self.provider.send('+998900000001', 'Synthetic notification')
+                self.assertNotIn('private-transport-error', str(caught.exception))
+                self.assertEqual(self.responses, [])
+
+    async def test_invalid_local_input_never_contacts_provider(self):
+        for phone, text in [('bad-phone', 'Synthetic'), ('+998900000001', '')]:
+            with self.assertRaises(sms.SMSRejectedError):
+                await self.provider.send(phone, text)
+        self.assertEqual(self.requests, [])
+
+    async def test_environment_settings_and_missing_credentials(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(SMSNotConfigured):
+                await sms.send_sms('+998900000001', 'Synthetic')
+        configuration = ('synthetic@example.invalid', 'synthetic-password', 'template', 'nickname')
+        provider = SimpleNamespace(configuration=configuration, send=AsyncMock(return_value='synthetic-sms'))
+        environment = dict(zip(('TEXTUP_EMAIL', 'TEXTUP_PASSWORD', 'TEXTUP_TEMPLATE_ID', 'TEXTUP_NICKNAME_ID'), configuration))
+        with patch.dict(os.environ, environment, clear=True), patch('sms._textup_client', None), \
+                patch('sms.TextUPClient', return_value=provider) as factory:
+            self.assertEqual(await sms.send_sms('+998900000001', 'Synthetic'), 'synthetic-sms')
+            self.assertEqual(await sms.send_sms('+998900000001', 'Synthetic'), 'synthetic-sms')
+            factory.assert_called_once_with(*configuration)
+            self.assertEqual(provider.send.await_count, 2)
 
 
 if __name__ == "__main__":

@@ -4,17 +4,38 @@ import asyncio
 import errno
 import logging
 import os
+import re
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 from telegram import Bot, BotCommand, BotCommandScopeChat
 from telegram.ext import Application
 
-from config import ROOT, load_settings
+from config import ROOT, TIMEZONE, load_demo_settings, load_settings
 from db import Database
 from handlers.ui import register_handlers
 from scheduler import DeliveryService
+from sms import SMSNotConfigured
 
 logger = logging.getLogger(__name__)
+
+
+class RedactingFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        moment = datetime.fromtimestamp(record.created, TIMEZONE)
+        return moment.strftime(datefmt or '%Y-%m-%d %H:%M:%S%z')
+
+    def format(self, record):
+        value = super().format(record)
+        for key, secret in os.environ.items():
+            if secret and any(word in key.upper() for word in ('TOKEN', 'PASSWORD', 'API_KEY', 'SECRET')):
+                value = value.replace(secret, '[REDACTED]')
+        value = re.sub(r'(?i)(/bot|\b)([0-9]{5,}:[A-Za-z0-9_-]{10,})', r'\1[REDACTED]', value)
+        value = re.sub(r'(?i)(Bearer\s+)[^\s\"\',;]+', r'\1[REDACTED]', value)
+        value = re.sub(r'\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', '[REDACTED]', value)
+        value = re.sub(r'''(?ix)((?:password|accessToken|refreshToken|api[_-]?key|bot[_-]?token)["']?\s*[:=]\s*)
+                          (?:"[^"\n]*"|'[^'\n]*'|[^\s,;}]+)''', r'\1[REDACTED]', value)
+        return value
 
 
 def configure_logging():
@@ -24,6 +45,8 @@ def configure_logging():
         RotatingFileHandler(directory / "bot.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"),
         logging.StreamHandler(),
     ])
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(RedactingFormatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
     # HTTP URLs contain bot tokens, so never enable request logging.
     for name in ("httpx", "httpcore", "telegram", "apscheduler"):
         logging.getLogger(name).setLevel(logging.CRITICAL)
@@ -36,7 +59,7 @@ class InstanceLock:
 
     def __enter__(self):
         path = self.path
-        path.parent.mkdir(exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         self.handle = path.open("a+b")
         # Windows byte locks also deny reads. Acquire before any file I/O;
         # locking an empty file is supported, so no sentinel byte is needed.
@@ -79,12 +102,17 @@ async def post_stop(application):
     await application.bot_data["service"].stop()
 
 
+async def demo_sms_sender(phone, message):
+    raise SMSNotConfigured("Namoyish rejimida haqiqiy SMS yuborilmaydi.")
+
+
 def build_application(settings):
     application = (Application.builder().token(settings.token).concurrent_updates(False)
                    .post_init(post_init).post_stop(post_stop).build())
     database = Database(settings.database)
     application.bot_data.update(settings=settings, db=database,
-                                service=DeliveryService(application.bot, database, settings))
+                                service=DeliveryService(application.bot, database, settings,
+                                                        sms_sender=demo_sms_sender if settings.demo else None))
     register_handlers(application)
     return application
 
@@ -98,14 +126,15 @@ async def check_connection(settings):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="Check Telegram authentication without polling or sending messages")
+    parser.add_argument("--demo", action="store_true", help="Run with a separate demo bot and database")
     args = parser.parse_args()
     configure_logging()
     try:
-        settings = load_settings()
+        settings = load_demo_settings() if args.demo else load_settings()
         if args.check:
             asyncio.run(check_connection(settings))
         else:
-            with InstanceLock():
+            with InstanceLock(settings.database.parent / "bot.lock"):
                 application = build_application(settings)
                 application.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=False, bootstrap_retries=3)
     except PermissionError as exc:
