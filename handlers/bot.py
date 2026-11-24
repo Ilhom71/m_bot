@@ -12,7 +12,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
 from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 from db import STATUSES
-from excel_utils import MAX_FILE_SIZE, ValidationError, appeals_workbook, build_workbook, import_notes, parse_datetime, parse_excel, phone_number
+from excel_utils import APPEAL_UPLOAD_PROMPT, MAX_FILE_SIZE, ValidationError, appeals_workbook, build_workbook, import_notes, parse_datetime, parse_excel, phone_number
 from scheduler import appeal_list_text, pages
 
 logger = logging.getLogger(__name__)
@@ -71,8 +71,10 @@ async def help_command(update, context):
 async def upload_appeals(update, context):
     context.user_data.clear()
     context.user_data["upload"] = "appeals"
-    await reply(update, "Murojaatlar .xlsx faylini yuboring. Ustunlar: id, mijoz_ismi, telefon, murojaat_matni, yuborish_vaqti; xodim — ixtiyoriy.\n"
-                "Vaqt katagi bo'sh bo'lsa, umumiy avtomatik jadval ishlatiladi. Jadvalni 'Avtomatik yuborish' tugmasida bir marta tanlang. O'tgan vaqtli qatorlar darhol navbatga tushadi. /bekor — bekor qilish.")
+    await reply(update, APPEAL_UPLOAD_PROMPT + "\n"
+                "Standart ustunlar — id, mijoz_ismi, murojaat_matni, yuborish_vaqti. Telefon va xodim ustunlari ixtiyoriy.\n"
+                "Vaqt katagi bo'sh bo'lsa, umumiy jadval ishlatiladi. O'tgan vaqtli qatorlar darhol navbatga tushadi. "
+                "/bekor orqali yuklashni bekor qilishingiz mumkin.")
 
 
 @admin_only
@@ -99,7 +101,8 @@ async def document(update, context):
     try:
         remote = await doc.get_file()
         data = bytes(await remote.download_as_bytearray())
-        rows = await asyncio.to_thread(parse_excel, data, kind, context.bot_data["settings"].timezone)
+        rows = await asyncio.to_thread(parse_excel, data, kind, context.bot_data["settings"].timezone,
+                                       filename=doc.file_name)
         db = context.bot_data["db"]
         if kind == "employees":
             db.import_employees(rows)
@@ -111,9 +114,8 @@ async def document(update, context):
             message += '\n' + import_notes(rows)
             if db.default_schedule():
                 message += "\nVaqti kelganda bot tasdiqlangan xodimlarga o'zi yuboradi. ID kiritish shart emas."
-            if any(row.get("legacy") for row in rows):
-                message += "\nEski jadval tanildi. Kirish raqami matnda saqlandi; bot ID si L- bilan boshlanadi. 'Muddati' yuborish vaqti sifatida olinmadi."
-                message += "\nUzun matnlar to'liq saqlandi. Bo'sh arizachi 'Ko'rsatilmagan' deb belgilandi. Noma'lum xodimlar biriktirishni kutadi."
+            if any(row.get("legacy") and row["id"].startswith("L-") for row in rows):
+                message += "\nEski jadvaldagi kirish raqami matnda saqlandi. Bot ID si L- bilan boshlanadi."
         db.assign_due(time.time(), context.bot_data["settings"].timezone)
         context.user_data.pop("upload", None)
         await reply(update, message + "\n/bugun yoki /royxat orqali tekshiring.")
@@ -233,7 +235,7 @@ async def confirm(update, context):
 @admin_only
 async def templates(update, context):
     for filename, columns in (
-        ("murojaatlar.xlsx", ["id", "mijoz_ismi", "telefon", "murojaat_matni", "yuborish_vaqti", "xodim"]),
+        ("murojaatlar.xlsx", ["id", "mijoz_ismi", "telefon", "murojaat_matni", "yuborish_vaqti", "xodim", "xodim_telefoni"]),
         ("xodimlar.xlsx", ["ism", "telefon", "telegram_id", "smena_vaqti", "qoshimcha_telefon"]),
     ):
         workbook = Workbook()
@@ -391,7 +393,7 @@ async def export_employees(update, context):
                r["shift"], str(r["telegram_id"] or ""), "tasdiqlangan" if r["approved"] else "tasdiq kerak", r['phone_extra']] for r in rows]
     workbook = await asyncio.to_thread(build_workbook, ["ism", "telefon", "telegram_id", "smena_vaqti", "ulangan_telegram_id", "ulanish_holati", "qoshimcha_telefon"], values, "Xodimlar")
     await update.effective_message.reply_document(document=workbook, filename="xodimlar.xlsx",
-        caption="Tahrirlab, Xodim yuklash orqali qayta yuboring. Ulanish holati Excel orqali tasdiqlanmaydi.")
+        caption="Tahrirlangan faylni Xodimlar → Excel yuklash orqali qayta yuboring. Ulanishni botda admin tasdiqlaydi.")
 
 
 @admin_only
@@ -466,9 +468,8 @@ async def join_contact(update, context):
         await reply(update, "Faqat o'zingizning kontaktingizni 'Telefonimni ulashish' tugmasi orqali yuboring.")
         return
     try:
-        raw = contact.phone_number
-        normalized = phone_number(raw)
-        request_id = context.bot_data["db"].join_by_phone(normalized, update.effective_user.id)
+        user = update.effective_user
+        request_id = context.bot_data["db"].join_by_phone(contact.phone_number, user.id, user.username)
         context.user_data.clear()
         if request_id:
             notify_join(context, request_id)

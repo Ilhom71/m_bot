@@ -13,13 +13,14 @@ from telegram.error import BadRequest, TelegramError
 from telegram.ext import CallbackQueryHandler, CommandHandler, ConversationHandler, MessageHandler, filters
 
 from db import STATUSES, assignment_problem
-from excel_utils import MAX_FILE_SIZE, ValidationError, appeal_contact, import_notes, parse_datetime, parse_excel, phone_number, shift_value
+from excel_utils import APPEAL_UPLOAD_PROMPT, MAX_FILE_SIZE, ValidationError, appeal_contact, import_notes, parse_datetime, parse_excel, phone_number, shift_value
 from . import bot as legacy
 
 WAIT = 1
 # Leave room for headings even when every body character uses two UTF-16 units.
 BODY_PAGE_SIZE = 1600
 STALE = "Bu tugma eskirgan, /menu bosing"
+SMS_PASSWORD_UNCONFIGURED = "SMS boshqaruvi qulflangan. Parolni bot egasi terminal orqali belgilaydi."
 PUBLIC_ROUTES = {"home", "cancel", "join", "mine", "appeal", "moretext", "own", "done"}
 ROUTES = PUBLIC_ROUTES | {"appeals", "list", "pages", "card", "staff", "workers", "worker",
     "add", "upload", "joins", "request", "approve", "reject", "schedule", "mode", "off",
@@ -102,6 +103,12 @@ async def start(update, context):
     db(context).register_user(update.effective_user.id, update.effective_user.username)
     await home(update, context)
     args = getattr(context, 'args', None) or []
+    if args == ['assignment_status']:
+        if admin(update, context):
+            await dispatch(update, context, 'status', [])
+        else:
+            await show(update, context, 'Bu bo‘lim faqat adminlar uchun.')
+        return WAIT
     if args:
         target = re.fullmatch(r'task_([1-9][0-9]{0,18})', args[0]) if len(args) == 1 else None
         if target:
@@ -121,7 +128,8 @@ async def cancel(update, context):
 
 def appeal_rows(context, kind="all"):
     database = db(context)
-    statuses = {r["id"]: r for r in database.list_appeals(context.bot_data["settings"].timezone, today=kind == "today")}
+    statuses = {r["id"]: r for r in database.list_appeals(
+        context.bot_data["settings"].timezone, today=kind == "today", sent_today=kind == "sent_today")}
     with database.connect() as conn:
         rows = [dict(r) for r in conn.execute("SELECT rowid AS number,id,client_name,source_json FROM appeals ORDER BY created_at DESC,rowid DESC")]
     result = [dict(r, **{k: v for k, v in statuses[r["id"]].items() if k != "id"}) for r in rows if r["id"] in statuses]
@@ -131,6 +139,8 @@ def appeal_rows(context, kind="all"):
         result = [row for row in result if row['completed_at'] is not None]
     elif kind == 'sent':
         result = [row for row in result if row['telegram'] == 'sent']
+    elif kind == 'sent_today':
+        result.sort(key=lambda row: row['telegram_updated_at'], reverse=True)
     elif kind == 'unsent':
         result = [row for row in result if row['telegram'] != 'sent' and row['completed_at'] is None]
     elif kind == 'sms':
@@ -199,13 +209,16 @@ async def listing(update, context, kind, page=0):
     if total > 1:
         buttons.append([button(context, f"◀️ {page+1}/{total} ▶️", f"pages:{kind}:{page}:list")])
     state(context)['sms_back' if kind == 'sms' else 'list_back'] = f"list:{kind}:{page}"
-    title = {'today': 'Bugungi', 'all': 'Barcha', 'unassigned': 'Mos xodim topilmagan',
+    title = {'today': 'Bugungi', 'sent_today': 'Bugun yuborilgan', 'all': 'Barcha', 'unassigned': 'Mos xodim topilmagan',
              'unconnected': 'Xodimi ulanmagan', 'completed': 'Bajarilgan', 'sent': 'Yuborilgan',
              'unsent': 'Yuborilmagan'}.get(kind, 'E’tibor talab qiladigan')
     text = f"{title} murojaatlar: {len(rows)}"
+    if kind == 'unconnected':
+        text += f"\nBotga ulanmagan xodimlar: {len({row['employee_id'] for row in rows})} ta"
     if kind == 'sms':
         text = f"SMSda bormaganlar: {len(rows)}\nVaqti kelgan va SMS qabul qilingani tasdiqlanmagan murojaatlar.\nNoma’lum natijani qabul qiluvchidan tekshiring."
-    await show(update, context, text, buttons, 'smssettings' if kind == 'sms' else 'appeals')
+    back = {'sms': 'smssettings', 'unassigned': 'status', 'unconnected': 'status'}.get(kind, 'appeals')
+    await show(update, context, text, buttons, back)
 
 
 async def card(update, context, number):
@@ -217,7 +230,8 @@ async def card(update, context, number):
     when = datetime.fromtimestamp(row["due_at"], zone).strftime("%d.%m.%Y %H:%M") if row["due_at"] else "belgilanmagan"
     label, name = appeal_contact(row)
     contact_line = f"{label}: {name[:150]}\n" if name else ""
-    text = f"{contact_line}Telefon: {row['phone']}\nXodim: {employee['name'] if employee else row['employee_hint'] or 'biriktirilmagan'}\nVaqt: {when}\n\n"
+    text = (f"Murojaat #{identifier}\n{contact_line}Telefon: {row['phone']}\n"
+            f"Xodim: {employee['name'] if employee else row['employee_hint'] or 'biriktirilmagan'}\nVaqt: {when}\n\n")
     if row['completed_at'] is not None:
         text += 'Ijro: ✅ Bajarildi — ' + datetime.fromtimestamp(row['completed_at'], zone).strftime('%d.%m.%Y %H:%M') + '\n\n'
     telegram = next(c for c in channels if c['channel'] == 'telegram')
@@ -349,7 +363,8 @@ async def dispatch(update, context, route, args):
         await home(update, context)
     elif route == 'appeals':
         await show(update, context, "Murojaatlar", [[button(context, label, action)] for label, action in
-            (("Bugun", "list:today:0"), ("Yuborilgan", "list:sent:0"), ("Yuborilmagan", "list:unsent:0"),
+            (("Bugun", "list:today:0"), ("Bugun yuborilgan murojaatlar", "list:sent_today:0"),
+             ("Yuborilgan", "list:sent:0"), ("Yuborilmagan", "list:unsent:0"),
              ("Hammasi", "list:all:0"), ("Excel yuklash", "upload:appeals"))])
     elif route == 'list':
         await listing(update, context, args[0], int(args[1]))
@@ -380,6 +395,7 @@ async def dispatch(update, context, route, args):
     elif route == 'staff':
         await show(update, context, "Xodimlar", [[button(context, label, action)] for label, action in
             (("Ro‘yxat", "workers:0"), ("Qo‘shish", "add"), ("Excel yuklash", "upload:employees"),
+             ("Excelga chiqarish", "file:employees"),
              (f"Ulanish so‘rovlari ({len(database.pending_joins())})", "joins:0"))])
     elif route == 'workers':
         await choose_workers(update, context, page=int(args[0]))
@@ -403,7 +419,8 @@ async def dispatch(update, context, route, args):
         kind = args[0]
         if kind not in ('appeals', 'employees'):
             raise ValueError(STALE)
-        await prompt(update, context, {'kind': 'upload', 'type': kind}, "Excel (.xlsx) faylini yuboring. Namuna: " + ('murojaatlar.xlsx' if kind == 'appeals' else 'xodimlar.xlsx'), 'appeals' if kind == 'appeals' else 'staff')
+        message = APPEAL_UPLOAD_PROMPT if kind == 'appeals' else 'Excel (.xlsx) faylini yuboring. Namuna — xodimlar.xlsx'
+        await prompt(update, context, {'kind': 'upload', 'type': kind}, message, 'appeals' if kind == 'appeals' else 'staff')
     elif route in ('joins', 'request'):
         rows = database.pending_joins()
         index = min(int(args[0]), max(0, len(rows)-1)) if route == 'joins' else next((i for i,r in enumerate(rows) if r['id'] == int(args[0])), -1)
@@ -436,8 +453,14 @@ async def dispatch(update, context, route, args):
     elif route == 'sms':
         if len(args) not in (1, 2) or args[0] not in ('on', 'off') or (len(args) == 2 and args[1] not in ('extra', 'schedule', 'smssettings')):
             raise ValueError(STALE)
-        database.set_sms_enabled(args[0] == 'on')
-        await dispatch(update, context, args[1] if len(args) == 2 else 'schedule', [])
+        back = args[1] if len(args) == 2 else 'schedule'
+        if not database.sms_password_configured():
+            await show(update, context, SMS_PASSWORD_UNCONFIGURED, back=back)
+            return
+        action = 'yoqish' if args[0] == 'on' else 'o‘chirish'
+        await prompt(update, context, dict(kind='sms_password', enabled=args[0] == 'on', back=back,
+                                          expires=time.monotonic() + 120),
+                     f"SMS’ni {action} uchun parolni yuboring. So‘rov 2 daqiqa amal qiladi.", back)
     elif route == 'mode':
         database.set_default_schedule(':'.join(args), settings.timezone)
         database.assign_due(time.time(), settings.timezone)
@@ -612,6 +635,8 @@ async def input_message(update, context, text_override=None):
         state(context).pop('message', None)
     if text == '❌ Bekor':
         return await cancel(update, context)
+    if flow and flow['kind'] == 'sms_password':
+        return await sms_password_input(update, context, flow)
     if text in ADMIN_KEYS or text in USER_KEYS or text == '🏠 Menyu':
         if text in ADMIN_KEYS and not admin(update, context):
             await update.effective_message.reply_text('Bu amal faqat adminlar uchun.')
@@ -635,7 +660,8 @@ async def input_message(update, context, text_override=None):
             contact = update.effective_message.contact
             if not contact or contact.user_id != update.effective_user.id:
                 raise ValueError('O‘z kontaktingizni pastdagi telefon yuborish tugmasi orqali ulashing.')
-            request_id = db(context).join_by_phone(phone_number(contact.phone_number), update.effective_user.id)
+            request_id = db(context).join_by_phone(contact.phone_number, update.effective_user.id,
+                                                   update.effective_user.username)
             if request_id:
                 legacy.notify_join(context, request_id)
             clear_flow(context)
@@ -658,9 +684,6 @@ async def input_message(update, context, text_override=None):
             value = text
             if index == 1:
                 value = phone_number(text)
-                if kind == 'employee' and any(value in (r['phone'], r['phone_extra']) and r['name'].casefold() != values[0].casefold()
-                                               for r in db(context).employee_list()):
-                    raise ValueError('Bu telefon boshqa xodimga tegishli. Boshqa raqam yozing.')
             if kind == 'employee':
                 if index == 2:
                     value = '' if text == '-' else text.lower()
@@ -699,15 +722,49 @@ async def input_message(update, context, text_override=None):
     return WAIT
 
 
+async def sms_password_input(update, context, flow):
+    clear_flow(context)
+    if not admin(update, context):
+        await home(update, context)
+        return WAIT
+    message = update.effective_message
+    if message.text is None:
+        await prompt(update, context, flow, "SMS parolini matn sifatida yuboring.", flow['back'])
+        return WAIT
+    try:
+        deleted = await message.delete()
+    except TelegramError:
+        deleted = False
+    if not deleted:
+        await show(update, context, "Parol xabari o‘chmadi. Uni chatdan o‘chiring va amalni qaytadan boshlang.",
+                   back=flow['back'])
+        return WAIT
+    if time.monotonic() >= flow['expires']:
+        await show(update, context, "Parol so‘rovi muddati tugadi. SMS tugmasini qayta bosing.", back=flow['back'])
+        return WAIT
+    result = await asyncio.to_thread(db(context).change_sms_with_password, flow['enabled'], message.text,
+                                     update.effective_user.id)
+    if result == 'changed':
+        await dispatch(update, context, flow['back'], [])
+    elif result == 'invalid':
+        await prompt(update, context, flow, "Parol noto‘g‘ri. Qayta kiriting.", flow['back'])
+    else:
+        text = ("Urinishlar chegarasiga yetdingiz. 5 daqiqadan keyin qayta urinib ko‘ring."
+                if result == 'locked' else SMS_PASSWORD_UNCONFIGURED)
+        await show(update, context, text, back=flow['back'])
+    return WAIT
+
+
 async def import_document(update, context, kind):
     document = update.effective_message.document
     if not document or not (document.file_name or '').lower().endswith('.xlsx'):
-        raise ValueError('Faqat .xlsx fayl yuboring. Masalan: xodimlar.xlsx')
+        raise ValueError('Faqat .xlsx fayl yuboring.')
     if document.file_size and document.file_size > MAX_FILE_SIZE:
         raise ValueError('Fayl 5 MB dan oshmasin.')
     remote = await document.get_file()
     content = bytes(await remote.download_as_bytearray())
-    rows = await asyncio.to_thread(parse_excel, content, kind, context.bot_data['settings'].timezone)
+    rows = await asyncio.to_thread(parse_excel, content, kind, context.bot_data['settings'].timezone,
+                                   filename=document.file_name)
     database = db(context)
     if kind == 'employees':
         database.import_employees(rows)

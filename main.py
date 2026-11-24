@@ -5,13 +5,16 @@ import errno
 import logging
 import os
 import re
+import sys
+import warnings
 from datetime import datetime
+from getpass import GetPassWarning, getpass
 from logging.handlers import RotatingFileHandler
 
 from telegram import Bot, BotCommand, BotCommandScopeChat
 from telegram.ext import Application
 
-from config import ROOT, TIMEZONE, load_demo_settings, load_settings
+from config import ROOT, TIMEZONE, Settings, load_demo_settings, load_settings
 from db import Database
 from handlers.ui import register_handlers
 from scheduler import DeliveryService
@@ -127,7 +130,25 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="Check Telegram authentication without polling or sending messages")
     parser.add_argument("--demo", action="store_true", help="Run with a separate demo bot and database")
+    parser.add_argument("--set-sms-password", action="store_true", help="Set the SMS control password in a local terminal")
     args = parser.parse_args()
+    if args.set_sms_password:
+        if args.demo or args.check or not sys.stdin.isatty():
+            parser.error("SMS parolini alohida buyruq bilan interaktiv terminalda belgilang.")
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", GetPassWarning)
+                password = getpass("SMS boshqaruvi paroli: ")
+                confirmation = getpass("Parolni takrorlang: ")
+            if password != confirmation:
+                parser.error("Parollar bir xil bo‘lishi kerak.")
+            Database(Settings.database).set_sms_password(password)
+        except (EOFError, GetPassWarning, KeyboardInterrupt):
+            parser.error("Parolni yashirin kiritish yakunlanmadi.")
+        except ValueError as exc:
+            parser.error(str(exc))
+        print("SMS boshqaruvi paroli saqlandi.")
+        return
     configure_logging()
     try:
         settings = load_demo_settings() if args.demo else load_settings()

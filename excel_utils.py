@@ -14,16 +14,32 @@ from config import TIMEZONE
 MAX_FILE_SIZE = 5 * 1024 * 1024
 LEGACY_DEADLINE_WARNING = ("⚠️ Муддати — hujjat ijro muddati; yuborish vaqti sifatida olinmadi. "
                            "Yuborish bo'limidan vaqt tanlang yoki yuborish_vaqti ustunini to'ldiring.")
+PORTAL_DEADLINE_HEADERS = ("муддат", "хозирги муддати")
+PORTAL_DEADLINE_WARNING = ("⚠️ Муддат va Хозирги муддати — portal ijro muddatlari. "
+                           "Xabar yuborish vaqtini Yuborish bo'limidan tanlang.")
+APPEAL_UPLOAD_PROMPT = ("Murojaatlar uchun .xlsx fayl yuboring. Standart shablon, eski murojaatlar jadvali, "
+                        "IIV portallari va PP100 formatlari qabul qilinadi. Bot birinchi varaqni o'qiydi. "
+                        "Telefon orqali biriktirish uchun xodim_telefoni ustunini to'ldiring.")
+EMPLOYEE_PHONE_REFERENCE = "phone:"
+PHONE_EXPORT_FILENAME = re.compile(r"murojaatlar_bot_murojatlar asil_[0-9]{8}_[0-9]{6}\.xlsx", re.IGNORECASE)
+PHONE_EXPORT_HEADERS = {"id", "mijoz_ismi", "telefon", "murojaat_matni", "yuborish_vaqti", "xodim"}
 
 
 def import_notes(rows):
     notes = ["Bir xil ID va bir xil ma'lumot takroran yuborilmaydi. Tahrir faqat yuborish boshlanmaguncha mumkin; "
              "bo'sh vaqt/xodim oldingi qiymatni saqlaydi. Yangi murojaatga yangi ID bering."]
+    duplicates = sum(row.get("pp100_duplicates", 0) for row in rows)
+    if duplicates:
+        notes.append(f"PP100: {duplicates} ta takroriy qator o'tkazib yuborildi. Har bir raqamning birinchi qatori olindi.")
+    if any((row.get("employee_ref") or "").startswith(EMPLOYEE_PHONE_REFERENCE) for row in rows):
+        notes.append("Telefon bo‘yicha moslik topilmagan yoki bir nechta xodim mos kelgan murojaatlar Holat bo‘limida ko‘rinadi.")
     if any('муддати' in row.get('source_data', {}) for row in rows):
         notes.append(LEGACY_DEADLINE_WARNING)
+    if any(row.get("source_data", {}).keys() & PORTAL_DEADLINE_HEADERS for row in rows):
+        notes.append(PORTAL_DEADLINE_WARNING)
     return "\n".join(notes)
 HEADERS = {
-    "appeals": ("id", "mijoz_ismi", "telefon", "murojaat_matni", "yuborish_vaqti"),
+    "appeals": ("id", "mijoz_ismi", "murojaat_matni", "yuborish_vaqti"),
     "employees": ("ism", "telefon", "telegram_id"),
 }
 LEGACY_HEADERS = {
@@ -31,6 +47,15 @@ LEGACY_HEADERS = {
     "ҳужжат мазмуни": "murojaat_matni", "кимга юборилган": "xodim",
 }
 LEGACY_SENDER_HEADER = "юборган ижрочи"
+PORTAL_HEADERS = {
+    "ариза рақами": "id", "мурожаат рақами": "id",
+    "мурожаат муаллифининг ф.и.ш.": "mijoz_ismi",
+    "фамиля": "surname", "фамилия": "surname", "исми": "given_name",
+    "мурожат таснифи": "murojaat_matni", "мурожаат таснифи": "murojaat_matni",
+    "ижрочи": "xodim",
+}
+PORTAL_APPEAL_FIELDS = {"id", "mijoz_ismi", "surname", "given_name", "murojaat_matni"}
+PORTAL_IMPORT_FIELDS = PORTAL_APPEAL_FIELDS | {"xodim", "xodim_telefoni", "telefon", "yuborish_vaqti"}
 
 
 class ValidationError(ValueError):
@@ -107,7 +132,62 @@ def in_shift(shift, moment):
     return start <= current < end if start < end else current >= start or current < end
 
 
-def parse_excel(payload: bytes, kind: str, timezone: ZoneInfo) -> list[dict]:
+def find_header(sheet, kind):
+    for row_number, cells in enumerate(sheet.iter_rows(max_row=20, max_col=60), 1):
+        source = [normalized_header(cell.value) for cell in cells]
+        names = set(source)
+        if kind == "employees" or (row_number == 1 and "id" in names):
+            return row_number, source, source, ""
+        if (set(LEGACY_HEADERS) - {"аризачи"}).issubset(names) and names & {"аризачи", LEGACY_SENDER_HEADER}:
+            return row_number, source, [LEGACY_HEADERS.get(name, name) for name in source], "L"
+        mapped = [PORTAL_HEADERS.get(name, name) for name in source]
+        mapped_names = set(mapped)
+        if names & {"ариза рақами", "мурожаат рақами"} and {"id", "murojaat_matni"}.issubset(mapped_names):
+            if "mijoz_ismi" in mapped_names:
+                return row_number, source, mapped, "IIV"
+            if {"surname", "given_name"}.issubset(mapped_names):
+                return row_number, source, mapped, "PP100"
+    return None
+
+
+def import_rows(workbook, kind, filename):
+    sheet = next(iter(workbook.worksheets), None) if kind == "appeals" else workbook.active
+    match = find_header(sheet, kind) if sheet is not None else None
+    if match is None:
+        required = ", ".join(HEADERS[kind])
+        raise ValidationError([f"1-qator: shablon sarlavhasi topilmadi. Standart ustunlar — {required}"])
+
+    header_row, source, header, layout = match
+    portal = layout in ("IIV", "PP100")
+    sheet_label = "1-varaq, " if portal else ""
+    if sheet.max_row is None or sheet.max_column is None:
+        # Some valid XLSX exporters omit the optional worksheet dimension.
+        sheet.calculate_dimension(force=True)
+    if sheet.max_row > 5020 or sheet.max_column > 60:
+        raise ValidationError([f"{sheet_label}Ko'pi bilan 5000 qator va 60 ustun yuklang."])
+    location = f"{sheet_label}{header_row}-qator"
+    required = {"id", "murojaat_matni"} if layout else set(HEADERS[kind]) - {"telegram_id"}
+    missing = sorted(required - set(header))
+    if missing:
+        raise ValidationError([f"{location}: ustunlar yetishmayapti: " + ", ".join(missing)])
+    names = [name for name in header if name]
+    if len(names) != len(set(names)):
+        raise ValidationError([f"{location}: takroriy ustun nomi mavjud."])
+    phone_export = (kind == "appeals" and not layout and set(names) == PHONE_EXPORT_HEADERS
+                    and PHONE_EXPORT_FILENAME.fullmatch(filename) is not None)
+    if phone_export:
+        header = ["xodim_telefoni" if name == "telefon" else name for name in header]
+    rows = sheet.iter_rows(min_row=header_row + 1)
+    for row_number, cells in enumerate(rows, header_row + 1):
+        if portal:
+            populated = any(clean(cell.value) for name, cell in zip(header, cells) if name in PORTAL_APPEAL_FIELDS)
+        else:
+            populated = any(cell.value is not None for cell in cells)
+        if populated:
+            yield row_number, f"{sheet_label}{row_number}-qator", cells, source, header, layout, phone_export
+
+
+def parse_excel(payload: bytes, kind: str, timezone: ZoneInfo, *, filename: str = "") -> list[dict]:
     timezone = TIMEZONE
     if len(payload) > MAX_FILE_SIZE:
         raise ValidationError(["Fayl 5 MB dan oshmasin."])
@@ -120,52 +200,24 @@ def parse_excel(payload: bytes, kind: str, timezone: ZoneInfo) -> list[dict]:
         raise
     except Exception:
         raise ValidationError(["Fayl buzilgan yoki haqiqiy .xlsx emas."]) from None
-    errors, output, seen = [], [], set()
+    errors, output, seen = [], [], {}
     try:
-        sheet = workbook.active
-        if sheet.max_row is None or sheet.max_column is None:
-            # Some valid XLSX exporters omit the optional worksheet dimension.
-            sheet.calculate_dimension(force=True)
-        if sheet.max_row > 5020 or sheet.max_column > 60:
-            raise ValidationError(["Ko'pi bilan 5000 qator va 60 ustun yuklang."])
-        iterator = sheet.iter_rows()
-        header = [normalized_header(cell.value) for cell in next(iterator, [])]
-        header_row, legacy = 1, False
-        if kind == "appeals" and "id" not in header:
-            while True:
-                legacy_required = set(LEGACY_HEADERS) - {"аризачи"}
-                if legacy_required.issubset(header) and ("аризачи" in header or LEGACY_SENDER_HEADER in header):
-                    legacy = True
-                    break
-                if header_row >= 20:
-                    break
-                cells = next(iterator, None)
-                if cells is None:
-                    break
-                header = [normalized_header(cell.value) for cell in cells]
-                header_row += 1
-        source_headers = list(header)
-        if legacy:
-            header = [LEGACY_HEADERS.get(name, name) for name in header]
-        missing = sorted(set(HEADERS[kind]) - set(header))
-        if legacy:
-            missing = [name for name in missing if name not in ("telefon", "yuborish_vaqti", "mijoz_ismi")]
-        if kind == "employees":
-            missing = [name for name in missing if name != "telegram_id"]
-        if missing:
-            raise ValidationError([f"{header_row}-qator: ustunlar yetishmayapti: " + ", ".join(missing)])
-        names = [name for name in header if name]
-        if len(names) != len(set(names)):
-            raise ValidationError(["1-qator: takroriy ustun nomi mavjud."])
-        for row_number, cells in enumerate(iterator, header_row + 1):
-            if all(cell.value is None for cell in cells):
-                continue
+        rows = import_rows(workbook, kind, filename)
+        for count, (row_number, location, cells, source_headers, header, layout, phone_export) in enumerate(rows, 1):
+            if count > 5000:
+                raise ValidationError(["Bir faylda jami 5000 tagacha ma'lumot qatori yuklang."])
             try:
-                if any(cell.data_type == "f" for cell in cells):
+                if any(cell.data_type == "f" for name, source, cell in zip(header, source_headers, cells)
+                       if layout not in ("IIV", "PP100") or name in PORTAL_IMPORT_FIELDS
+                       or source in PORTAL_DEADLINE_HEADERS):
                     raise ValueError("formula o'rniga oddiy qiymat kiriting")
                 row = {key: cell.value for key, cell in zip(header, cells) if key}
-                source_data = {key: clean(cell.value) for key, cell in zip(source_headers, cells) if key} if legacy else {
-                    key.removeprefix("asl:"): clean(value) for key, value in row.items() if key.startswith("asl:")}
+                if layout:
+                    source_data = {key: clean(cell.value) for key, cell in zip(source_headers, cells)
+                                   if key and (layout == "L" or key in PORTAL_DEADLINE_HEADERS)}
+                else:
+                    source_data = {key.removeprefix("asl:"): clean(value)
+                                   for key, value in row.items() if key.startswith("asl:")}
                 if kind == "employees":
                     name = clean(row["ism"])
                     if not name or len(name) > 120:
@@ -180,44 +232,69 @@ def parse_excel(payload: bytes, kind: str, timezone: ZoneInfo) -> list[dict]:
                     item = dict(name=name, phone=phone, phone_extra=extra,
                                 telegram_ref=contact.lower() or "phone:" + phone, shift=shift_value(row.get("smena_vaqti")))
                     key = name.casefold()
-                    for other in output:
-                        if ({phone, extra} - {None}) & ({other["phone"], other.get("phone_extra")} - {None}):
-                            raise ValueError(f"asosiy yoki qo'shimcha telefon {other['row_number']}-qatordagi boshqa xodimda takrorlangan")
-                        if other["telegram_ref"] == item["telegram_ref"]:
-                            raise ValueError("Telegram identifikatori faylda takrorlangan")
+                    if contact and any(other["telegram_ref"] == item["telegram_ref"] for other in output):
+                        raise ValueError("Telegram identifikatori faylda takrorlangan")
                 else:
                     appeal_id = clean(row["id"])
                     name, body = clean(row.get("mijoz_ismi")), clean(row["murojaat_matni"])
-                    if legacy:
+                    employee_ref = clean(row.get("xodim"))
+                    employee_phone = clean(row.get("xodim_telefoni"))
+                    if phone_export and not employee_phone:
+                        raise ValueError("telefon ustuniga xodim raqamini kiriting")
+                    if layout:
                         if not appeal_id:
-                            raise ValueError("Kirish raqami bo'sh")
-                        original_id = appeal_id
-                        appeal_id = "L-" + hashlib.sha256(original_id.encode()).hexdigest()[:16]
-                        body = f"Kirish raqami: {original_id}\n{body}" if body else ""
+                            raise ValueError("Murojaat raqami bo'sh" if layout != "L" else "Kirish raqami bo'sh")
+                        number_label = "Kirish raqami" if layout == "L" else "Murojaat raqami"
+                        body = body or "Hujjat mazmuni ko'rsatilmagan."
+                        body = f"{number_label}: {appeal_id}\n{body}"
+                        appeal_id = f"{layout}-" + hashlib.sha256(appeal_id.encode()).hexdigest()[:16]
+                        if layout == "PP100":
+                            surname, given_name = clean(row.get("surname")), clean(row.get("given_name"))
+                            name = " ".join(filter(None, (surname, given_name)))
+                            if not employee_ref and not employee_phone and surname and given_name:
+                                employee_ref = name
                         name = name or "Ko'rsatilmagan"
-                        body = body or f"Kirish raqami: {original_id}\nHujjat mazmuni ko'rsatilmagan."
-                    if not re.fullmatch(r"[\w.-]{1,64}", appeal_id):
-                        raise ValueError("id 1–64 ta harf, raqam, nuqta yoki chiziqdan iborat bo'lsin")
+                    if not re.fullmatch(r"[\w./-]{1,64}", appeal_id):
+                        raise ValueError("id 1–64 belgidan iborat bo'lsin. Harf, raqam, _, -, . va / ishlatiladi")
                     if not name or len(name) > 32767:
                         raise ValueError("mijoz_ismi majburiy va Excel katagi chegarasidan (32767) oshmasin")
                     if not body or len(body) > 32767:
                         raise ValueError("murojaat_matni majburiy va Excel katagi chegarasidan (32767) oshmasin")
                     when = row.get("yuborish_vaqti")
-                    legacy_row = legacy or clean(row.get("manba_formati")) == "eski_jadval"
+                    legacy_row = bool(layout) or clean(row.get("manba_formati")) == "eski_jadval"
                     phone_raw = clean(row.get("telefon"))
-                    phone = "Ko'rsatilmagan" if legacy_row and phone_raw in ("", "Ko'rsatilmagan") else phone_number(phone_raw)
+                    phone = "Ko'rsatilmagan" if phone_raw in ("", "Ko'rsatilmagan") else phone_number(phone_raw)
+                    if employee_phone:
+                        try:
+                            employee_phone = phone_number(employee_phone)
+                        except ValueError as exc:
+                            column = "telefon" if phone_export else "xodim_telefoni"
+                            raise ValueError(f"{column}: {exc}") from None
+                        qualifier = "|" + employee_ref if employee_ref else ""
+                        employee_ref = EMPLOYEE_PHONE_REFERENCE + employee_phone + qualifier
+                    elif employee_ref.startswith("+"):
+                        try:
+                            employee_ref = EMPLOYEE_PHONE_REFERENCE + phone_number(employee_ref)
+                        except ValueError as exc:
+                            raise ValueError(f"xodim: {exc}") from None
                     item = dict(id=appeal_id, client_name=name, phone=phone,
                                 body=body, due_at=parse_datetime(when, timezone).timestamp() if clean(when) else None,
-                                employee_ref=clean(row.get("xodim")), legacy=legacy_row, source_data=source_data)
+                                employee_ref=employee_ref, legacy=legacy_row, source_data=source_data)
                     key = appeal_id
                 if key in seen:
+                    if layout == "PP100":
+                        first = seen[key]
+                        first["pp100_duplicates"] = first.get("pp100_duplicates", 0) + 1
+                        continue
                     raise ValueError(f"ID '{key}' faylda takrorlangan; har bir ID faqat bitta qatorda bo'lsin" if kind == 'appeals'
                                      else "ism faylda takrorlangan")
-                seen.add(key)
+                seen[key] = item
                 item["row_number"] = row_number
+                if layout in ("IIV", "PP100"):
+                    item["row_location"] = location
                 output.append(item)
             except (ValueError, TypeError) as exc:
-                errors.append(f"{row_number}-qator: {exc}.")
+                errors.append(f"{location}: {exc}.")
                 if len(errors) >= 50:
                     errors.append("Dastlabki 50 xato ko'rsatildi; tuzatib qayta yuklang.")
                     break
@@ -260,11 +337,16 @@ def appeals_workbook(rows, timezone):
     timezone = TIMEZONE
     sources = [json.loads(row.get("source_json") or "{}") for row in rows]
     keys = list(dict.fromkeys(key for source in sources for key in source))
-    columns = ["id", "mijoz_ismi", "telefon", "murojaat_matni", "yuborish_vaqti", "xodim", "manba_formati"]
+    columns = ["id", "mijoz_ismi", "telefon", "murojaat_matni", "yuborish_vaqti", "xodim", "manba_formati", "xodim_telefoni"]
     values = []
     for row, source in zip(rows, sources):
         when = datetime.fromtimestamp(row["due_at"], timezone).replace(tzinfo=None) if row["due_at"] else None
+        hint = row.get("employee_hint") or ""
+        employee_phone = ""
+        employee = row.get("employee") or hint
+        if hint.startswith(EMPLOYEE_PHONE_REFERENCE):
+            employee_phone, _, employee = hint.removeprefix(EMPLOYEE_PHONE_REFERENCE).partition("|")
         values.append([row["id"], row["client_name"], row["phone"], row["body"], when,
-                       row.get("employee") or row.get("employee_hint", ""), "eski_jadval" if row.get("legacy") else "standart"] +
+                       employee, "eski_jadval" if row.get("legacy") else "standart", employee_phone] +
                       [source.get(key, "") for key in keys])
     return build_workbook(columns + ["asl:" + key for key in keys], values)

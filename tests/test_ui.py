@@ -4,17 +4,22 @@ import inspect
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 import warnings
 from zoneinfo import ZoneInfo
 
 from config import Settings
 from db import Database
+from excel_utils import parse_excel
 from handlers import ui
 from main import post_init
 from test_bot import appeal, employee, workbook_bytes
+
+
+TEST_SMS_PASSWORD = "synthetic SMS control password"
 
 
 class NavigationTests(unittest.IsolatedAsyncioTestCase):
@@ -33,7 +38,7 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         self.db.request_join(2, 1001)
         self.db.request_join(3, 1002)
         self.message = SimpleNamespace(message_id=42, reply_text=AsyncMock(return_value=SimpleNamespace(message_id=42)),
-            reply_document=AsyncMock(), text='', contact=None, document=None)
+            reply_document=AsyncMock(), delete=AsyncMock(return_value=True), text='', contact=None, document=None)
         self.update = SimpleNamespace(effective_chat=SimpleNamespace(id=987, type='private'),
             effective_user=SimpleNamespace(id=987, username=None), effective_message=self.message)
         self.bot = SimpleNamespace(edit_message_text=AsyncMock(), edit_message_reply_markup=AsyncMock(), set_my_commands=AsyncMock())
@@ -62,6 +67,11 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         await ui.callback(self.update, self.context)
         self.update.callback_query.answer.assert_awaited_once()
 
+    async def enter_sms_password(self, password=TEST_SMS_PASSWORD):
+        self.message.text = password
+        await ui.input_message(self.update, self.context)
+        self.message.text = ''
+
     async def test_public_commands_only_and_five_sections(self):
         await post_init(SimpleNamespace(bot_data=self.context.bot_data, bot=self.bot))
         for call in self.bot.set_my_commands.call_args_list:
@@ -76,22 +86,37 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         await self.click('schedule')
         self.assertIn('SMS yuborish: ✅ Yoqilgan', self.last_screen['text'])
         self.assertIn('sms:off', str(self.markup()))
+        await self.click('sms:off')
+        self.assertEqual(self.last_screen['text'], ui.SMS_PASSWORD_UNCONFIGURED)
+        self.assertTrue(self.db.sms_enabled())
+        self.db.set_sms_password(TEST_SMS_PASSWORD)
         await self.click('sms:off', user=555)
         self.assertTrue(self.db.sms_enabled())
+        self.assertNotIn('flow', ui.state(self.context))
         await self.click('sms:off')
+        self.assertTrue(self.db.sms_enabled())
+        await self.enter_sms_password("wrong password")
+        self.assertIn('Parol noto‘g‘ri', self.last_screen['text'])
+        self.assertTrue(self.db.sms_enabled())
+        await self.enter_sms_password()
+        self.assertEqual(self.message.delete.await_count, 2)
         self.assertFalse(self.db.sms_enabled())
         self.assertIn('SMS yuborish: ❌ O‘chirilgan', self.last_screen['text'])
         self.assertIn('sms:on', str(self.markup()))
         self.assertIn('SMS yuborish: o‘chirilgan', self.db.status_text())
         await self.click('sms:off')
+        await self.enter_sms_password()
         self.assertFalse(self.db.sms_enabled())
         await self.click('sms:on')
+        self.assertFalse(self.db.sms_enabled())
+        await self.enter_sms_password()
         self.assertTrue(self.db.sms_enabled())
         await self.click('sms:invalid')
         self.assertEqual(self.last_screen['text'], ui.STALE)
         self.assertTrue(self.db.sms_enabled())
 
     async def test_settings_keyboard_opens_sms_controls_and_keeps_legacy_shortcut(self):
+        self.db.set_sms_password(TEST_SMS_PASSWORD)
         await ui.start(self.update, self.context)
         labels = [key.text for line in self.markup().keyboard for key in line]
         self.assertIn('⚙️ Sozlamalar', labels)
@@ -104,11 +129,13 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         await self.click(off.callback_data.split(':', 2)[2], user=555)
         self.assertTrue(self.db.sms_enabled())
         await self.click(off.callback_data.split(':', 2)[2])
+        await self.enter_sms_password()
         self.assertFalse(self.db.sms_enabled())
         self.assertIn('⚙️ Sozlamalar', self.last_screen['text'])
         self.assertIn('SMS yuborish: ❌ O‘chirilgan', self.last_screen['text'])
         self.assertIn('sms:on:extra', str(self.markup()))
         await self.click('sms:on:extra')
+        await self.enter_sms_password()
         self.assertTrue(self.db.sms_enabled())
         await self.click('sms:off:status')
         self.assertTrue(self.db.sms_enabled())
@@ -117,6 +144,21 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         await ui.input_message(self.update, self.context)
         self.assertIn('⚙️ Sozlamalar', self.last_screen['text'])
         self.assertIn('sms:off:extra', str(self.markup()))
+
+    async def test_sms_password_requires_a_fresh_prompt_and_deleted_message(self):
+        self.db.set_sms_password(TEST_SMS_PASSWORD)
+        await ui.start(self.update, self.context)
+        await self.click('sms:off')
+        self.message.delete.return_value = False
+        await self.enter_sms_password()
+        self.assertTrue(self.db.sms_enabled())
+        self.assertIn('Parol xabari o‘chmadi', self.last_screen['text'])
+        await self.click('sms:off')
+        ui.state(self.context)['flow']['expires'] = 0
+        self.message.delete.return_value = True
+        await self.enter_sms_password()
+        self.assertTrue(self.db.sms_enabled())
+        self.assertIn('muddati tugadi', self.last_screen['text'])
 
     async def test_missing_applicant_buttons_use_appeal_id_and_open_correct_card(self):
         for index, name in enumerate(("Ko'rsatilmagan", 'Ko‘rsatilmagan', '')):
@@ -151,6 +193,7 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Юборган ижрочи: Synthetic Sender', self.last_screen['text'])
 
     async def test_sent_telegram_is_not_attention_regardless_of_sms_switch(self):
+        self.db.set_sms_password(TEST_SMS_PASSWORD)
         with self.db.connect() as conn:
             conn.execute("UPDATE deliveries SET status='sent' WHERE channel='telegram'")
             conn.execute("UPDATE deliveries SET status='failed',attempts=4 WHERE channel='sms'")
@@ -159,6 +202,7 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('E’tibor talab qiladigan murojaatlar: 0', self.last_screen['text'])
         self.assertNotIn('SMS', self.last_screen['text'])
         await self.click('sms:off')
+        await self.enter_sms_password()
         await self.click('status')
         self.assertIn('E’tibor talab qiladigan murojaatlar: 0', self.last_screen['text'])
         self.assertIn('✅ Yuborishda e’tibor talab qiladigan muammo yo‘q.', self.last_screen['text'])
@@ -170,6 +214,7 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(labels)
         self.assertTrue(all(label.startswith('✅') for label in labels))
         await self.click('sms:on')
+        await self.enter_sms_password()
         await self.click('status')
         self.assertIn('E’tibor talab qiladigan murojaatlar: 0', self.last_screen['text'])
 
@@ -225,7 +270,9 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue({'LONG-0', 'LONG-1', 'LONG-5'}.issubset({row['id'] for row in records}))
         await self.click('smssettings')
         self.assertIn('SMSda bormaganlar: 13', self.last_screen['text'])
+        self.db.set_sms_password(TEST_SMS_PASSWORD)
         await self.click('sms:off:smssettings')
+        await self.enter_sms_password()
         self.assertFalse(self.db.sms_enabled())
         self.assertIn('SMS sozlamalari', self.last_screen['text'])
         await self.click('list:sms:0')
@@ -560,20 +607,72 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
             await ui.input_message(self.update, self.context)
             self.assertIn('faqat adminlar', self.last_screen['text'])
 
+    async def test_admin_downloads_employee_excel_from_staff_menu(self):
+        await ui.start(self.update, self.context)
+        await self.click('staff')
+        export = next(button for row in self.markup().inline_keyboard for button in row
+                      if button.text == 'Excelga chiqarish')
+        action = export.callback_data.split(':', 2)[2]
+        await self.click(action, user=555)
+        self.message.reply_document.assert_not_awaited()
+        await self.click(action)
+        self.message.reply_document.assert_awaited_once()
+        download = self.message.reply_document.await_args.kwargs
+        self.assertEqual(download['filename'], 'xodimlar.xlsx')
+        employees = parse_excel(download['document'].getvalue(), 'employees', self.settings.timezone)
+        self.assertEqual(len(employees), 12)
+        self.assertEqual(employees[0]['name'], 'Worker 0')
+
+    async def test_sent_today_lists_telegram_success_by_tashkent_day(self):
+        start = datetime(2026, 11, 24, tzinfo=self.settings.timezone)
+        noon = start + timedelta(hours=12)
+        yesterday = (start - timedelta(seconds=1)).timestamp()
+        tomorrow = (start + timedelta(days=1)).timestamp()
+        for identifier, due in (('FIRST-SENT', yesterday), ('LATEST-SENT', yesterday),
+                                ('YESTERDAY-SENT', noon.timestamp()), ('SMS-ONLY', noon.timestamp()),
+                                ('NEXT-DAY', noon.timestamp())):
+            self.db.import_appeals([appeal(identifier, due, 'Worker 0')])
+        with self.db.connect() as connection:
+            connection.executemany("UPDATE deliveries SET status='sent',updated_at=? WHERE appeal_id=? AND channel=?",
+                                   [(start.timestamp(), 'FIRST-SENT', 'telegram'),
+                                    (noon.timestamp(), 'LATEST-SENT', 'telegram'),
+                                    (yesterday, 'YESTERDAY-SENT', 'telegram'),
+                                    (noon.timestamp(), 'SMS-ONLY', 'sms'),
+                                    (tomorrow, 'NEXT-DAY', 'telegram')])
+
+        with patch("db.datetime") as clock:
+            clock.now.return_value = noon
+            await ui.start(self.update, self.context)
+            await self.click('appeals')
+            self.assertTrue(any(b.text == 'Bugun yuborilgan murojaatlar' for line in self.markup().inline_keyboard for b in line))
+            await self.click('list:sent_today:0')
+            self.assertIn('Bugun yuborilgan murojaatlar: 2', self.last_screen['text'])
+            ids = [row['id'] for row in ui.appeal_rows(self.context, 'sent_today')]
+            self.assertEqual(ids, ['LATEST-SENT', 'FIRST-SENT'])
+            self.assertIn('YESTERDAY-SENT', {row['id'] for row in ui.appeal_rows(self.context, 'today')})
+
     async def test_status_has_separate_assignment_problem_lists(self):
         row = appeal('UNCONNECTED', time.time()-10, 'Worker 1')
         missing = appeal('MISSING', time.time()-10, 'Missing Worker')
         missing['legacy'] = True
         self.db.import_appeals([row, missing])
+        self.context.args = ['assignment_status']
         await ui.start(self.update, self.context)
-        await self.click('status')
         actions = [b.callback_data.split(':', 2)[2] for line in self.markup().inline_keyboard for b in line]
         self.assertIn('list:unconnected:0', actions)
         self.assertIn('list:unassigned:0', actions)
         await self.click('list:unconnected:0')
         self.assertIn('Xodimi ulanmagan murojaatlar: 1', self.last_screen['text'])
+        self.assertIn('Botga ulanmagan xodimlar: 1 ta', self.last_screen['text'])
+        card_action = next(b.callback_data.split(':', 2)[2] for line in self.markup().inline_keyboard
+                           for b in line if ':card:' in b.callback_data)
+        await self.click(card_action)
+        self.assertIn('Murojaat #UNCONNECTED', self.last_screen['text'])
         await self.click('list:unassigned:0')
         self.assertIn('Mos xodim topilmagan murojaatlar: 1', self.last_screen['text'])
+        self.update.effective_user.id = 555
+        await ui.start(self.update, self.context)
+        self.assertIn('faqat adminlar uchun', self.last_screen['text'])
 
     async def test_legacy_deadline_upload_warns_and_does_not_schedule_from_deadline(self):
         await ui.start(self.update, self.context)
@@ -587,6 +686,41 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('yuborish vaqti sifatida olinmadi', self.last_screen['text'])
         row = next(r for r in self.db.export_appeals() if r['legacy'])
         self.assertIsNone(row['due_at'])
+
+    async def test_phone_export_upload_assigns_employee_from_telefon_column(self):
+        await ui.start(self.update, self.context)
+        await self.click('upload:appeals')
+        headers = ['id', 'mijoz_ismi', 'telefon', 'murojaat_matni', 'yuborish_vaqti', 'xodim']
+        payload = workbook_bytes(headers, [
+            ['L-TEST/2026-1', 'Test Client', 900000000, 'Test body', None, 'WORKER 0'],
+        ])
+        self.message.document = SimpleNamespace(
+            file_name='murojaatlar_bot_murojatlar asil_20261124_120154.xlsx', file_size=len(payload),
+            get_file=AsyncMock(return_value=SimpleNamespace(
+                download_as_bytearray=AsyncMock(return_value=bytearray(payload)))))
+        await ui.input_message(self.update, self.context)
+
+        self.assertIn('1 ta murojaat saqlandi', self.last_screen['text'])
+        row, _ = self.db.details('L-TEST/2026-1')
+        self.assertEqual(row['employee_id'], 1)
+        self.assertEqual(row['phone'], "Ko'rsatilmagan")
+
+    async def test_pp100_upload_saves_unique_appeals_and_reports_duplicates(self):
+        await ui.start(self.update, self.context)
+        await self.click('upload:appeals')
+        payload = workbook_bytes(['Ариза рақами', 'Фамиля', 'Исми', 'Мурожат таснифи'],
+                                 [['PP/1', 'Test surname', 'Test name', 'First body'],
+                                  ['PP/1', 'Test surname', 'Test name', 'Duplicate body'],
+                                  ['PP/2', 'Test surname', 'Test name', 'Unique body']])
+        self.message.document = SimpleNamespace(file_name='pp100.xlsx', file_size=len(payload), get_file=AsyncMock(
+            return_value=SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(payload)))))
+        await ui.input_message(self.update, self.context)
+
+        self.assertIn('2 ta murojaat saqlandi', self.last_screen['text'])
+        self.assertIn('1 ta takroriy qator', self.last_screen['text'])
+        appeals = [row for row in self.db.export_appeals() if row['id'].startswith('PP100-')]
+        self.assertEqual(len(appeals), 2)
+        self.assertTrue(any(row['body'].endswith('First body') for row in appeals))
 
     async def test_disconnect_requires_admin_confirmation_and_approval_notifies_worker(self):
         await ui.start(self.update, self.context)

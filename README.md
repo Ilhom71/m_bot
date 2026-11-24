@@ -90,8 +90,11 @@ eski tugma bosilganda bot xabar beradi.
 
 - **Sozlamalar → SMS sozlamalari → SMS o‘chirish / SMS yoqish** orqali SMS kanalini boshqaring.
   **SMSda bormaganlar** ro'yxati ham shu yerda. SMS tugmasi Sozlamalar boshida ham bor.
-  Bu tugma **Yuborish** bo‘limida ham bor. Yangilanishdan keyin `/menu` bosing.
-  Sozlama bazada saqlanadi va qayta ishga tushirish talab qilinmaydi. Dastlab SMS yoqilgan.
+  Bu tugma **Yuborish** bo‘limida ham bor. Har safar holatni o‘zgartirishda admin SMS parolini kiritadi.
+  Bot egasi parolni o‘rnatish yoki almashtirish uchun bot ishlayotgan kompyuterda terminaldan
+  `.\.venv\Scripts\python.exe main.py --set-sms-password` buyrug‘ini ishlatadi. Terminalda parol ko‘rinmaydi.
+  Parol o‘rnatilguncha SMS holatini o‘zgartirish qulflangan. Bot parol xabarini chatdan o‘chiradi
+  va shundan so‘ng parolni tekshiradi. Sozlama bazada saqlanadi va darhol qo‘llanadi.
   SMS o‘chirilganda Telegram ishlaydi; hali yuborilmagan SMS navbati va urinishlar tarixi
   saqlanadi. Qayta yoqish paytida vaqti o‘tgan SMS’lar avtomatik yuborilmaydi.
   Kerakli SMS’ni **SMSda bormaganlar → SMSni navbatga qo‘yish** orqali alohida yuboring.
@@ -114,14 +117,17 @@ eski tugma bosilganda bot xabar beradi.
 - Xodim ismi bo'sh bo'lsa, tasdiqlangan va smenasi mos xodim avtomatik tanlanadi.
   Noma'lum ism boshqa xodimga almashtirilmaydi.
 - **Qo'shimcha** da bo'sh shablonlar, xodimlar va murojaatlarni Excel olish bor.
+  Xodimlar ro'yxatini **Xodimlar → Excelga chiqarish** orqali ham yuklab olish mumkin.
   Tahrirlangan faylni tegishli bo'limning **Excel yuklash** tugmasida qayta yuboring.
   Murojaat ID si o'zgarmasin; bo'sh vaqt/xodim avvalgi qiymatni saqlaydi.
   Yuborish boshlangan qatorni o'zgartirish butun importni rad etadi.
 - Eski jadvalning asl ustunlari `asl:` prefiksi bilan saqlanadi.
 - Tasdiqlanmagan xodimga Telegram ham, SMS ham yuborilmaydi.
 - **Holat → Mos xodim topilmagan** va **Xodimi ulanmagan** alohida ro'yxatlardir.
-  Muammo aniqlanganda adminga navbatdagi worker tekshiruvida ogohlantirish boradi;
-  bir xil murojaat va sabab uchun soatiga bir martadan ko'p takrorlanmaydi.
+  Biriktirish muammosi bo'lsa, adminga soatiga ko'pi bilan bitta jamlanma yuboriladi.
+  Jamlanmada ulanmagan xodimlar, ulanishni kutayotgan murojaatlar va mos xodim
+  topilmagan murojaatlar soni ko'rinadi. Jamlanmadagi havola **Holat** bo'limini
+  ochadi. Ro'yxatlardan murojaat kartochkalarini bittalab ochish mumkin.
 - Xodim kartochkasidagi **Ulanishni uzish** tasdiqlangach, kirish va yuborish huquqi
   bekor qilinadi, kutayotgan ulanish so'rovlari eskiradi, xodimga xabar beriladi.
   Qayta ulanish uchun o'z kontaktini yana yuborishi va admin tasdiqlashi kerak.
@@ -137,23 +143,37 @@ tekshiruvida yuboriladi. Oldingi `sent` va `unknown` holatlar avtomatik takrorla
 
 ## Excel formatlari
 
-Sarlavhalar birinchi qatorda, ma'lumot birinchi varaqda bo'lsin. 5 MB, 5000 qator
-va 60 ustungacha. Formulalar qabul qilinmaydi. Xatoda qator raqami va sabab
+Standart murojaat shablonida sarlavhalar birinchi varaqning birinchi qatorida bo'lsin.
+Xodimlar shablonida faol varaq ishlatiladi.
+Fayl hajmi 5 MB, ma'lumot qatorlari jami 5000 ta, ustunlar har varaqda 60 tagacha.
+Formulalar qabul qilinmaydi. Xatoda qator raqami va sabab
 ko'rsatiladi, butun import bekor qilinadi. Qisman import bo'lmaydi.
 
-**murojaatlar.xlsx:** `id`, `mijoz_ismi`, `telefon`, `murojaat_matni`,
-`yuborish_vaqti`, ixtiyoriy `xodim`.
+**murojaatlar.xlsx:** `id`, `mijoz_ismi`, `murojaat_matni`, `yuborish_vaqti`.
+Ixtiyoriy ustunlar — `telefon`, `xodim`, `xodim_telefoni`.
 
-- `id`: 1–64 ta harf/raqam, `_`, `-`, `.`; yagona bo'lsin.
-- `telefon`: xalqaro format, masalan `+998901234567`; 9 xonali O'zbekiston
-  raqamlari avtomatik `+998` bilan to'ldiriladi. Excelda matn sifatida saqlang.
+- `id`: 1–64 ta harf, raqam, `_`, `-`, `.` yoki `/` belgisidan iborat bo'lsin.
+  ID asl ko'rinishida saqlanadi va faylda yagona bo'lishi kerak.
+- `telefon`: mijoz raqami. Bo'sh qolishi mumkin. Raqam yozilsa, 9 xonali
+  O'zbekiston raqamiga `+998` qo'shiladi. Excelda matn sifatida saqlang.
+- `xodim_telefoni`: bot raqamni xodimlarning asosiy va qo'shimcha telefonlari
+  bilan solishtirib, yagona mos xodimni biriktiradi. `xodim` ustunida ism yoki
+  Telegram ID ham ko'rsatilsa, u ham telefonga mos kelishi kerak. Bu umumiy
+  raqam ishlatiladigan xodimlarni ajratishga yordam beradi. Moslik aniqlanmasa,
+  murojaat yuborishni kutadi. `xodim` ustuniga `+998` bilan boshlangan raqamni
+  yozish ham mumkin.
+- Alohida dasturdan olingan `murojaatlar_bot_murojatlar asil_YYYYMMDD_HHMMSS.xlsx`
+  faylida `telefon` ustuni xodim raqami uchun ishlatiladi. Bu qoidani ishga tushirish
+  uchun eksport nomi va olti ustun (`id`, `mijoz_ismi`, `telefon`,
+  `murojaat_matni`, `yuborish_vaqti`, `xodim`) saqlanishi kerak.
 - `mijoz_ismi`, `murojaat_matni`: Excel katagi chegarasigacha (32767 belgi).
   Botning oddiy foydalanuvchi anketasida qisqa kiritish cheklovi saqlanadi.
 - `yuborish_vaqti`: Excel sana-vaqti, `YYYY-MM-DD HH:MM` yoki `DD.MM.YYYY HH:MM`.
   Bo'sh katak uchun umumiy **Yuborish** rejimi ishlatiladi; jadval hali tanlanmagan bo'lsa,
   bot uni bir marta tanlashni taklif qiladi. O'tgan vaqt darhol navbatga tushadi.
-- `xodim`: ro'yxatdagi to'liq ism, Telegram ID yoki `@username`. Noma'lum xodim
-  standart formatda xato hisoblanadi. Bo'sh bo'lsa, shu yuborish vaqtida smenada
+- `xodim`: ro'yxatdagi to'liq ism, Telegram ID yoki `@username`. Faqat ism yoki
+  Telegram identifikatori yozilib, u ro'yxatda topilmasa, standart import xato qaytaradi.
+  Xodim va xodim telefoni ikkalasi bo'sh bo'lsa, shu yuborish vaqtida smenada
   bo'lgan, admin tasdiqlagan xodimlar
   orasidan eng kam murojaat biriktirilgan xodim tanlanadi; tenglikda bazadagi
   tartib ishlatiladi. Mos xodim bo'lmasa, murojaat kutadi va admin eslatma oladi.
@@ -168,9 +188,9 @@ ko'rsatiladi, butun import bekor qilinadi. Qisman import bo'lmaydi.
 
 `qoshimcha_telefon` ustuni yoki katagi bo'sh bo'lishi mumkin. Eski fayllar ham
 qabul qilinadi; ularda qo'shimcha raqam bo'sh deb olinadi. Xodimning asosiy va
-qo'shimcha raqami bir xil bo'lsa, qo'shimchasi saqlanmaydi. Bir raqam boshqa
-xodimning istalgan telefon ustunida takrorlansa, butun import bekor qilinadi;
-xato xabarida qator va sabab ko'rsatiladi.
+qo'shimcha raqami bir xil bo'lsa, qo'shimchasi saqlanmaydi. Bir raqam bir necha
+xodimda asosiy yoki qo'shimcha telefon sifatida ishlatilishi mumkin. SMS yoqilgan
+bo'lsa, har bir xodimga biriktirilgan murojaat uchun umumiy raqamga alohida SMS boradi.
 
 Raqamlar mavjud `phone_number` funksiyasi orqali `+998XXXXXXXXX` shakliga keladi:
 `90 123 45 67`, `901234567`, `998901234567`, `+998 (90) 123-45-67` bir xil
@@ -183,16 +203,17 @@ ism va telefon bilan kiritishi mumkin. Telegram ID hamda smena ixtiyoriy.
 Oxirida qo'shimcha telefon ham so'raladi; `yo'q` yoki `-` bilan o'tkazib yuboring.
 Xodim o'z telefonini ulashgach, rahbar tasdiqlaydi.
 
-- `telegram_id`: musbat raqamli ID, `@username` yoki bo'sh. Maydon faqat
-  ma'lumot uchun; ulanish tasdig'i har doim Telegram yuborgan o'z kontakt
-  telefonini Excel'dagi telefon bilan solishtirib beriladi.
+- `telegram_id`: musbat raqamli ID, `@username` yoki bo'sh. Xodim o'z kontaktini
+  ulashganda telefon bir necha xodimga mos kelsa, bot Telegram ID yoki `@username`
+  orqali ro'yxatdagi yozuvni aniqlaydi. Avval tasdiqlangan akkaunt o'z xodimiga
+  bog'langan holda qoladi.
 - Telegram bot foydalanuvchiga birinchi bo'lib shaxsiy chat ocholmaydi: `/start` shart.
   Telefon mos kelsa ulanish so'rovi ochiladi, admin tasdiqlagach ID bog'lanadi; tasdiqlangan ID
   username o'zgargani sababli boshqa odamga avtomatik o'tkazilmaydi.
 - `smena_vaqti`: `09:00-18:00`, `22:00-06:00`; bo'sh yoki teng vaqt — cheklovsiz.
   Smena avtomatik biriktirishda ishlatiladi. Adminning aniq tanlovi ustun.
-- Ismlar yagona bo'lsin. Bir xil ism bilan qayta import kontaktlarni yangilaydi;
-  boshqa xodimga tegishli telefon yoki Telegram identifikatori rad etiladi.
+- Ismlar va Telegram identifikatorlari yagona bo'lsin. Bir xil ism bilan qayta
+  import kontaktlarni yangilaydi.
   Asosiy telefon, qo'shimcha telefon yoki Telegram manzili o'zgarsa, qayta ulanish va admin tasdig'i talab
   qilinadi. Avvalgi tasdiqlash tugmalari yaroqsizlanadi. Yuborilgan holatlar o'zgarmaydi.
 
@@ -212,6 +233,27 @@ tugmasida bir marta jadval tanlash yetarli; alohida ID kiritish shart emas.
 Bu ustun mavjud bo'lsa, import natijasida alohida **⚠️ Муддати** ogohlantirishi chiqadi.
 Asl fayl o'zgartirilmaydi. Word xodimlar ro'yxati import qilinmaydi; ma'lumotni
 **Qo'shimcha -> Bo'sh shablonlar** dagi xodimlar Excel formatiga ko'chirish kerak.
+
+### IIV portallari va PP100 jadvallari
+
+**Murojaatlar → Excel yuklash** orqali faylni yuboring. Bot formatni dastlabki
+20 qatordagi ustun nomlaridan aniqlaydi. Faylning birinchi varag'idagi barcha
+to'ldirilgan murojaat qatorlari olinadi, jumladan filtrda yashirilganlari ham.
+Oradagi bo'sh qatorlar o'tkazib yuboriladi.
+
+- `Ариза рақами` yoki `Мурожаат рақами` asl ko'rinishida murojaat matniga qo'shiladi.
+  Shu raqamdan manbaga mos barqaror `IIV-...` yoki `PP100-...` ID yaratiladi.
+- `Ижрочи` to'ldirilgan bo'lsa, bot shu qiymatni xodimlar ro'yxati bilan tekshiradi.
+  PP100 da `Ижрочи` bo'sh bo'lsa, `Фамиля` va `Исми` birlashtiriladi. Ismlar
+  solishtirilganda katta-kichik harflar va bo'shliqlar hisobga olinmaydi.
+- Bitta xodim mos kelsa, murojaat unga biriktiriladi. Mos xodim topilmasa yoki
+  bir nechta xodim mos kelsa, admin **Xodim biriktirish** orqali aniqlashtiradi.
+  Yuborish uchun xodimning ulanishi tasdiqlangan bo'lishi kerak.
+- `Муддат` va `Хозирги муддати` ijro muddati sifatida saqlanadi.
+  Xabar yuborish uchun botdagi **Yuborish** jadvali ishlatiladi.
+- PP100 varag'ida bir raqam bir necha marta uchrasa, bot
+  birinchi qatorni oladi va o'tkazib yuborilgan takrorlarni natijada sanaydi.
+  IIV faylida takroriy raqam uchun bot xato chiqqan varaq va qatorni ko'rsatadi.
 
 ## Eslatmalar va ishonchlilik
 
@@ -306,7 +348,7 @@ qoladi; sababi SMS kartochkasida ko'rsatiladi. Bu kutish urinishlar limitini sar
    tasdiqlangan xodim o'z vazifalarini ko'radi. Admin callback amallari ham tekshiriladi.
 2. **Xodimlarni tayyorlash.** Admin ism va asosiy telefon bilan xodim qo'shadi yoki
    Excel yuklaydi. Qo'shimcha telefon, Telegram manzili va smena ixtiyoriy.
-   Telefonlar +998 formatiga keltiriladi; boshqa xodimning raqami takrorlanmaydi.
+   Telefonlar +998 formatiga keltiriladi. Bitta raqam bir necha xodimda bo'lishi mumkin.
 3. **Ulanishni tasdiqlash.** Xodim Telegramning kontakt yuborish tugmasi orqali
    o'z raqamini ulashadi. Asosiy yoki qo'shimcha telefon mos kelsa so'rov ochiladi.
    Admin tasdiqlamaguncha Telegram va SMS yuborish boshlanmaydi. Telefon yoki
@@ -330,6 +372,8 @@ qoladi; sababi SMS kartochkasida ko'rsatiladi. Bu kutish urinishlar limitini sar
    qismlarga bo'linadi. Qabul qilingan har bir qism bazaga yoziladi. Telegram muvaffaqiyati
    umumiy ro'yxatda Yuborildi degani; o'qilganlik tasdig'i olinmaydi.
 8. **Ro'yxatlar va holat.** Yuborilgan ro'yxati Telegram natijasiga qaraydi.
+   **Murojaatlar → Bugun yuborilgan murojaatlar** Toshkent vaqti bo'yicha bugun
+   Telegramda yuborilgan deb qayd etilgan murojaatlarni ko'rsatadi.
    Yuborilmagan ichida kelajakdagi vazifalar va hali hal qilinmaganlari ham bor.
    Hammasi yuborilgan va bajarilganlarni arxiv sifatida saqlaydi. Oddiy kartochkada
    mijoz, telefon, xodim, vaqt, murojaat matni va yuborish holati ko'rinadi.

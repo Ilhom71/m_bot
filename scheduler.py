@@ -9,6 +9,7 @@ from pathlib import Path
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
+from telegram.helpers import create_deep_linked_url
 
 from db import STATUSES, Database, assignment_problem
 from excel_utils import appeal_contact, appeals_workbook
@@ -217,19 +218,32 @@ class DeliveryService:
         if now.hour >= self.settings.reminder_hour:
             self.notice("daily:" + now.date().isoformat(), appeal_list_text(rows, self.settings.timezone, "Bugungi yuborishlar"))
         all_rows = self.db.list_appeals(self.settings.timezone)
-        reasons = {'unassigned': 'Mos xodim topilmadi. Xodim biriktiring yoki smenani tekshiring.',
-                   'unconnected': 'Biriktirilgan xodim botga ulanmagan. Ulanishini tasdiqlang.'}
+        unassigned, unconnected = 0, 0
+        unconnected_employees, pending = set(), []
         for row in all_rows:
-            if row['telegram'] == 'sent':
+            if row['telegram'] == 'sent' or row['completed_at'] is not None:
                 continue
             problem = assignment_problem(row)
-            if problem:
-                self.notice(f"assignment:{row['id']}:{problem}:" + now.strftime('%Y-%m-%d-%H'),
-                            f"⚠️ Murojaat #{row['id']}: {reasons[problem]} /menu → Holat.")
-        pending = [row for row in all_rows if row['completed_at'] is None and row['telegram'] != 'sent'
-                   and not assignment_problem(row) and (row['due_at'] is None or row['due_at'] <= now.timestamp())]
+            if problem == 'unassigned':
+                unassigned += 1
+            elif problem == 'unconnected':
+                unconnected += 1
+                unconnected_employees.add(row['employee_id'])
+            elif row['due_at'] is None or row['due_at'] <= now.timestamp():
+                pending.append(row)
+        hour = now.strftime('%Y-%m-%d-%H')
+        if unassigned or unconnected:
+            lines = ['⚠️ Murojaatlarni biriktirish holati']
+            if unconnected:
+                lines.append(f"Botga ulanmagan xodimlar: {len(unconnected_employees)} ta")
+                lines.append(f"Ulanishni kutayotgan murojaatlar: {unconnected} ta")
+            if unassigned:
+                lines.append(f"Mos xodim topilmagan murojaatlar: {unassigned} ta")
+            link = create_deep_linked_url(self.bot.username, "assignment_status")
+            lines.append(f"Tafsilotlar — {link}")
+            self.notice(f"assignment-summary:{hour}", "\n".join(lines))
         if pending:
-            self.notice("attention:" + now.strftime("%Y-%m-%d-%H"),
+            self.notice(f"attention:{hour}",
                         appeal_list_text(pending, self.settings.timezone, "Eslatma: vaqt kutilayotgan yoki yakunlanmagan murojaatlar"))
 
     async def send_notices(self):

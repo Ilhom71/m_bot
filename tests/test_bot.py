@@ -27,10 +27,10 @@ from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut
 
 from config import Settings, load_demo_settings, load_settings
 from db import Database
-from excel_utils import ValidationError, appeals_workbook, build_workbook, in_shift, parse_excel, phone_number
+from excel_utils import ValidationError, appeals_workbook, build_workbook, import_notes, in_shift, parse_excel, phone_number
 from handlers.bot import (ADMIN_MENU, USER_MENU, BUTTON_ACTIONS, automatic_schedule, send_now, command_actions, document, export_employees,
                           join_callback, join_contact, my_appeals, new_appeal, status, text_message, templates)
-from main import InstanceLock, RedactingFormatter, build_application
+from main import InstanceLock, RedactingFormatter, build_application, main as run_main
 from scheduler import DeliveryService
 from sms import SMSNotConfigured, SMSRetryableError
 
@@ -112,12 +112,17 @@ class ExcelTests(unittest.TestCase):
             row = parse_excel(workbook_bytes(columns, [values]), 'employees', TZ)[0]
             self.assertEqual(row['phone_extra'], expected)
 
-    def test_excel_cross_column_duplicate_has_row_number(self):
+    def test_excel_allows_shared_primary_and_extra_phones(self):
         for first, second in [(['A','901234567','911234567'], ['B','911234567',None]),
                               (['A','901234567','911234567'], ['B','931234567','911234567']),
-                              (['A','901234567',None], ['B','931234567','901234567'])]:
-            with self.assertRaisesRegex(ValidationError, '3-qator.*telefon'):
-                parse_excel(workbook_bytes(['ism','telefon','qoshimcha_telefon'], [first, second]), 'employees', TZ)
+                              (['A','901234567',None], ['B','931234567','901234567']),
+                              (['A','901234567',None], ['B','901234567',None])]:
+            self.assertEqual(len(parse_excel(workbook_bytes(['ism','telefon','qoshimcha_telefon'], [first, second]),
+                                             'employees', TZ)), 2)
+        with self.assertRaisesRegex(ValidationError, '3-qator.*Telegram'):
+            payload = workbook_bytes(['ism', 'telefon', 'telegram_id'], [['A', '901234567', '123'], ['B', '901234567', '123']])
+            parse_excel(payload, 'employees', TZ)
+
     def test_workbook_without_optional_dimension(self):
         original = workbook_bytes(["ism", "telefon", "telegram_id"], [["Test Worker", "+998900000001", None]])
         stream = BytesIO()
@@ -147,6 +152,20 @@ class ExcelTests(unittest.TestCase):
         payload = workbook_bytes(["ism", "telefon", "telegram_id", "smena_vaqti"],
                                  [["Test", "900000001", "@testworker", "22:00-06:00"]])
         self.assertEqual(parse_excel(payload, "employees", TZ)[0]["telegram_ref"], "@testworker")
+
+    def test_phone_export_filename_changes_the_phone_column_meaning(self):
+        headers = ["id", "mijoz_ismi", "telefon", "murojaat_matni", "yuborish_vaqti", "xodim"]
+        filename = "murojaatlar_bot_murojatlar asil_20261124_120154.xlsx"
+        payload = workbook_bytes(headers, [["TEST/1", "Test Client", "900000002", "Test body", None, "Test Worker"]])
+        row = parse_excel(payload, "appeals", TZ, filename=filename)[0]
+        self.assertEqual(row["phone"], "Ko'rsatilmagan")
+        self.assertEqual(row["employee_ref"], "phone:+998900000002|Test Worker")
+        standard = parse_excel(payload, "appeals", TZ, filename="murojaatlar.xlsx")[0]
+        self.assertEqual(standard["phone"], "+998900000002")
+        self.assertEqual(standard["employee_ref"], "Test Worker")
+        blank = workbook_bytes(headers, [["TEST/1", "Test Client", None, "Test body", None, "Test Worker"]])
+        with self.assertRaisesRegex(ValidationError, "2-qator: telefon .*xodim"):
+            parse_excel(blank, "appeals", TZ, filename=filename)
 
     def test_missing_columns_and_row_error(self):
         with self.assertRaisesRegex(ValidationError, "1-qator"):
@@ -198,6 +217,127 @@ class ExcelTests(unittest.TestCase):
         self.assertTrue(parse_excel(payload, "appeals", TZ)[0]["legacy"])
         payload = workbook_bytes(["ism", "telefon"], [["Worker", "+998900000003"]])
         self.assertEqual(parse_excel(payload, "employees", TZ)[0]["telegram_ref"], "phone:+998900000003")
+
+    def test_iiv_imports_first_sheet_even_when_second_is_active(self):
+        workbook = Workbook()
+        for index, number_header in enumerate(("Ариза рақами", "Мурожаат рақами"), 1):
+            sheet = workbook.active if index == 1 else workbook.create_sheet()
+            sheet.append(["Synthetic report"])
+            sheet.append(["№", number_header, "Мурожаат муаллифининг\nФ.И.Ш.", "Мурожат таснифи",
+                          "Яшаш манзили ёки юридик манзили", "Муддат", "ижрочи", "Хозирги муддати"])
+            sheet.append([index, f"IIV/{index}", "Test applicant", "Test body", "Unused address",
+                          datetime(2027, 2, 1), "Test Worker", "2027-02-02"])
+        workbook.active = 1
+        stream = BytesIO()
+        workbook.save(stream)
+
+        rows = parse_excel(stream.getvalue(), "appeals", TZ)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(all(row["id"].startswith("IIV-") and row["legacy"] for row in rows))
+        self.assertEqual(rows[0]["body"], "Murojaat raqami: IIV/1\nTest body")
+        self.assertEqual(rows[0]["employee_ref"], "Test Worker")
+        self.assertEqual(rows[0]["phone"], "Ko'rsatilmagan")
+        self.assertIsNone(rows[0]["due_at"])
+        self.assertEqual(rows[0]["source_data"], {"муддат": "2027-02-01 00:00:00", "хозирги муддати": "2027-02-02"})
+        self.assertEqual(rows[0]["row_location"], "1-varaq, 3-qator")
+        self.assertIn("Муддат", import_notes(rows))
+
+    def test_pp100_imports_only_the_first_sheet(self):
+        workbook = Workbook()
+        for index, serial_header in enumerate(("№", None), 1):
+            sheet = workbook.active if index == 1 else workbook.create_sheet()
+            sheet.append(["Synthetic report"])
+            sheet.append([serial_header, "Ариза рақами", "Фамиля", "Исми", "Мурожат таснифи", "Ижрочи"])
+            sheet.append([index, f"PP/{index}", "Test surname", "Test name", "Test body", None])
+        hidden = workbook.create_sheet()
+        hidden.sheet_state = "hidden"
+        hidden.append(["Ариза рақами", "Фамиля", "Исми", "Мурожат таснифи"])
+        hidden.append(["PP/2", "Test surname", "Test name", "Test body"])
+        workbook.active = 1
+        stream = BytesIO()
+        workbook.save(stream)
+
+        rows = parse_excel(stream.getvalue(), "appeals", TZ)
+        self.assertEqual([row["client_name"] for row in rows], ["Test surname Test name"])
+        self.assertTrue(rows[0]["id"].startswith("PP100-"))
+        self.assertIn("PP/1", rows[0]["body"])
+        self.assertEqual(rows[0]["row_location"], "1-varaq, 3-qator")
+        self.assertEqual(rows[0]["employee_ref"], "Test surname Test name")
+        exported = appeals_workbook([dict(row, employee_hint=row["employee_ref"],
+                                          source_json=json.dumps(row["source_data"])) for row in rows], TZ)
+        reimported = parse_excel(exported.getvalue(), "appeals", TZ)
+        self.assertEqual([row["id"] for row in rows], [row["id"] for row in reimported])
+        self.assertEqual(reimported[0]["employee_ref"], rows[0]["employee_ref"])
+
+        workbook.create_sheet(index=0)
+        workbook.active = 1
+        stream = BytesIO()
+        workbook.save(stream)
+        with self.assertRaisesRegex(ValidationError, "shablon sarlavhasi topilmadi"):
+            parse_excel(stream.getvalue(), "appeals", TZ)
+
+    def test_pp100_skips_empty_appeal_rows_and_reads_the_next_appeal(self):
+        headers = ["№", "Ариза рақами", "Фамиля", "Исми", "Мурожат таснифи", "Муддат"]
+        rows = [[1, "PP/1", "Test surname", "Test name", "Only appeal"],
+                [2, "  ", None, " ", None, "2027-02-01"],
+                [3, "PP/2", "Test surname", "Test name", "Below the gap"]]
+        for empty_row in (rows[1], [None] * len(headers)):
+            with self.subTest(empty_row=empty_row):
+                payload = workbook_bytes(headers, [rows[0], empty_row, rows[2]])
+                result = parse_excel(payload, "appeals", TZ)
+                self.assertEqual([row["body"] for row in result],
+                                 ["Murojaat raqami: PP/1\nOnly appeal", "Murojaat raqami: PP/2\nBelow the gap"])
+        with self.assertRaisesRegex(ValidationError, "ma'lumot qatorlari yo'q"):
+            parse_excel(workbook_bytes(headers, [rows[1]]), "appeals", TZ)
+
+    def test_pp100_loads_hidden_appeals_from_first_sheet(self):
+        workbook = Workbook()
+        filtered = workbook.active
+        other_sheet = workbook.create_sheet()
+        workbook.active = other_sheet
+        header = ["№", "Ариза рақами", "Фамиля", "Исми", "Мурожат таснифи"]
+        other_sheet.append(header)
+        other_sheet.append([1, "PP/other", "Test surname", "Test name", "Other sheet"])
+        filtered.append(["Synthetic PP100 report"])
+        filtered.append(header)
+        filtered.auto_filter.ref = "A2:E5"
+        filtered.append([1, "PP/1", "Test surname", "Test name", "Hidden by filter"])
+        filtered.row_dimensions[3].hidden = True
+        filtered.append([2])
+        filtered.append([3, "PP/2", "Test surname", "Test name", "Visible appeal"])
+        stream = BytesIO()
+        workbook.save(stream)
+
+        rows = parse_excel(stream.getvalue(), "appeals", TZ)
+        self.assertEqual([row["body"] for row in rows],
+                         ["Murojaat raqami: PP/1\nHidden by filter", "Murojaat raqami: PP/2\nVisible appeal"])
+
+    def test_pp100_skips_duplicates_in_first_sheet(self):
+        workbook = Workbook()
+        first, second = workbook.active, workbook.create_sheet()
+        header = ["Ариза рақами", "Фамиля", "Исми", "Мурожат таснифи"]
+        first.append(header)
+        first.append(["PP/1", "Test surname", "Test name", "First body"])
+        first.append(["PP/2", "Test surname", "Test name", "Unique body"])
+        first.append(["PP/1", "Test surname", "Test name", "First duplicate"])
+        first.append(["PP/1", "Test surname", "Test name", "Second duplicate"])
+        second.append(header)
+        second.append(["PP/3", "Test surname", "Test name", "Second sheet"])
+        workbook.active = 1
+        stream = BytesIO()
+        workbook.save(stream)
+
+        rows = parse_excel(stream.getvalue(), "appeals", TZ)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["body"], "Murojaat raqami: PP/1\nFirst body")
+        self.assertEqual(rows[1]["body"], "Murojaat raqami: PP/2\nUnique body")
+        self.assertIn("2 ta takroriy qator", import_notes(rows))
+
+    def test_iiv_duplicate_is_reported_with_sheet_and_row(self):
+        payload = workbook_bytes(["Мурожаат рақами", "Мурожаат муаллифининг Ф.И.Ш.", "Мурожат таснифи"],
+                                 [["IIV/1", "Test name", "Test body"]] * 2)
+        with self.assertRaisesRegex(ValidationError, "1-varaq, 3-qator: .*takrorlangan"):
+            parse_excel(payload, "appeals", TZ)
 
     def test_export_strings_cannot_become_formulas(self):
         stream = build_workbook(["name"], [["=1+1"], ["+SUM(A1)"], ["@test"]])
@@ -355,6 +495,24 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.service.tick()
         self.sms.assert_not_awaited()
 
+    async def test_sms_password_lockout_survives_restart_and_rotation(self):
+        original = "synthetic first password"
+        replacement = "synthetic replacement password"
+        self.db.set_sms_password(original)
+        for _ in range(4):
+            self.assertEqual(self.db.change_sms_with_password(False, "synthetic wrong password", 987), "invalid")
+        self.assertEqual(self.db.change_sms_with_password(False, "synthetic wrong password", 987), "locked")
+        restarted = Database(self.settings.database)
+        self.assertEqual(restarted.change_sms_with_password(False, original, 987), "locked")
+        self.assertTrue(restarted.sms_enabled())
+        with patch("db.time.time", return_value=time.time() + 301):
+            self.assertEqual(restarted.change_sms_with_password(False, original, 987), "changed")
+        self.assertFalse(restarted.sms_enabled())
+        restarted.set_sms_password(replacement)
+        self.assertEqual(restarted.change_sms_with_password(True, original, 987), "invalid")
+        self.assertEqual(restarted.change_sms_with_password(True, replacement, 987), "changed")
+        self.assertTrue(restarted.sms_enabled())
+
     async def test_upgrade_holds_backlog_when_sms_was_already_enabled(self):
         self.add_due()
         self.db.set_sms_enabled(True)
@@ -447,22 +605,33 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.channel()["status"], "failed")
         self.assertEqual(self.sms.await_count, 1)
 
-    async def test_assignment_warnings_have_distinct_reasons_and_do_not_repeat(self):
+    async def test_assignment_summary_counts_unique_employees_and_does_not_repeat(self):
         settings = replace(self.settings, admin_ids=frozenset({987}))
         service = DeliveryService(self.bot, self.db, settings, self.sms)
         self.db.import_employees([employee('Pending Worker', '222', '+998900000003')])
         missing = appeal('MISSING', time.time()-10, 'Missing Worker')
         missing['legacy'] = True
-        self.db.import_appeals([appeal('PENDING', time.time()-10, 'Pending Worker'), missing])
+        self.db.import_appeals([appeal('PENDING', time.time()-10, 'Pending Worker'),
+                                appeal('PENDING-2', time.time()-10, 'Pending Worker'), missing])
         service.prepare_reminders()
         service.prepare_reminders()
-        notices = [r for r in self.db.ready_notices(time.time()) if r['notice_key'].startswith('assignment:')]
-        self.assertEqual(len(notices), 2)
-        text = '\n'.join(r['text'] for r in notices)
-        self.assertIn('botga ulanmagan', text)
-        self.assertIn('Mos xodim topilmadi', text)
-        self.assertIn('Ulanmagan xodimga biriktirilgan murojaatlar: 1', self.db.status_text())
+        notices = [r for r in self.db.ready_notices(time.time()) if r['notice_key'].startswith('assignment')]
+        self.assertEqual(len(notices), 1)
+        text = notices[0]['text']
+        self.assertIn('Botga ulanmagan xodimlar: 1 ta', text)
+        self.assertIn('Ulanishni kutayotgan murojaatlar: 2 ta', text)
+        self.assertIn('Mos xodim topilmagan murojaatlar: 1 ta', text)
+        self.assertIn('?start=assignment_status', text)
+        self.assertNotIn('PENDING', text)
+        self.assertIn('Ulanmagan xodimga biriktirilgan murojaatlar: 2', self.db.status_text())
         self.assertIn('Mos xodim topilmagan murojaatlar: 1', self.db.status_text())
+
+    async def test_restart_retires_queued_per_appeal_assignment_notices(self):
+        self.db.enqueue_notice('assignment:TEST:unconnected:old:0', [987], 'Old assignment reminder')
+        self.db.enqueue_notice('daily:2026-01-01:0', [987], 'Daily reminder')
+        self.db.recover()
+        notices = self.db.ready_notices(time.time())
+        self.assertEqual([notice['text'] for notice in notices], ['Daily reminder'])
 
     async def test_delivery_timeouts_stop_hangs_and_never_resend_unknown(self):
         async def hanging_send(*args, **kwargs):
@@ -775,6 +944,91 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(self.db.details(item["id"])[0]["employee_id"])
         self.assertEqual(len(self.db.ready_deliveries(time.time())), 0)
 
+    async def test_portal_upload_queues_only_unique_employee_matches(self):
+        self.db.import_employees([
+            employee("TestWorker", "333", "+998900000003"),
+            employee("Other Employee", "444", "+998900000004"),
+            employee("Pending Employee", "555", "+998900000005"),
+        ])
+        request_id = self.db.request_join(3, 444)
+        self.db.decide_join(request_id, True, 987)
+        payload = workbook_bytes(
+            ["Ариза рақами", "Фамиля", "Исми", "Мурожат таснифи", "ижрочи"],
+            [
+                ["PP/1", "OTHER  ", "  employee", "Combined name", None],
+                ["PP/2", "OTHER", "employee", "Explicit executor", " tESt\u00a0wOrker "],
+                ["PP/3", "Test", "Worker", "Ambiguous name", None],
+                ["PP/4", "Other", "Employee", "Unmatched executor", "Unknown employee"],
+                ["PP/5", None, None, "Missing name", None],
+                ["PP/6", "Other", "Employee", "Approved employee", "123456789"],
+                ["PP/7", "Pending", "Employee", "Unapproved employee", None],
+            ],
+        )
+        rows = parse_excel(payload, "appeals", TZ)
+        self.assertEqual(self.db.import_appeals(rows), (7, 0))
+        now = time.time()
+        self.assertEqual(self.db.set_default_schedule("darhol", TZ, now), 3)
+        self.db.assign_due(now, TZ)
+        stored = [self.db.details(row["id"])[0] for row in rows]
+        self.assertEqual(stored[0]["employee_id"], 3)
+        self.assertTrue(all(row["employee_id"] is None and row["due_at"] is None for row in stored[1:5]))
+        self.assertEqual(stored[5]["employee_id"], 1)
+        self.assertEqual(stored[6]["employee_id"], 4)
+        ready = self.db.ready_deliveries(now)
+        self.assertEqual({(row["appeal_id"], row["telegram_id"]) for row in ready},
+                         {(rows[0]["id"], 444), (rows[5]["id"], 123456789)})
+
+        iiv_payload = workbook_bytes(
+            ["Ариза рақами", "Мурожаат муаллифининг Ф.И.Ш.", "Мурожат таснифи"],
+            [["IIV/1", "Test Worker", "Applicant name alone"]],
+        )
+        iiv_row = parse_excel(iiv_payload, "appeals", TZ)[0]
+        self.db.import_appeals([iiv_row])
+        self.assertEqual(self.db.apply_default_schedule(TZ, now), 0)
+        self.db.assign_due(now, TZ)
+        self.assertIsNone(self.db.details(iiv_row["id"])[0]["employee_id"])
+
+    async def test_excel_employee_phone_uses_primary_and_extra_and_holds_ambiguous_rows(self):
+        shared = "+998900000001"
+        unique = "+998900000003"
+        self.db.import_employees([dict(employee("Other Worker", "444", unique), phone_extra=shared)])
+        request = self.db.join_by_phone(unique, 444)
+        self.db.decide_join(request, True, 987)
+        headers = ["id", "mijoz_ismi", "murojaat_matni", "yuborish_vaqti", "xodim", "xodim_telefoni"]
+        payload = workbook_bytes(headers, [
+            ["UNIQUE", "Client", "Test body", None, None, "90 000 00 03"],
+            ["SHARED", "Client", "Test body", None, "TEST   worker", shared],
+            ["AMBIGUOUS", "Client", "Test body", None, None, shared],
+            ["UNKNOWN", "Client", "Test body", None, None, "+998900000099"],
+            ["CONFLICT", "Client", "Test body", None, "Test Worker", unique],
+            ["SHORTCUT", "Client", "Test body", None, unique, None],
+        ])
+        rows = parse_excel(payload, "appeals", TZ)
+        self.assertTrue(all(row["phone"] == "Ko'rsatilmagan" for row in rows))
+        self.assertEqual(self.db.import_appeals(rows), (6, 0))
+        exported = appeals_workbook(self.db.export_appeals(), TZ)
+        self.assertEqual(self.db.import_appeals(parse_excel(exported.getvalue(), "appeals", TZ)), (0, 6))
+        now = time.time()
+        self.db.set_default_schedule("darhol", TZ, now)
+        self.db.assign_due(now, TZ)
+        ready = self.db.ready_deliveries(now)
+        self.assertEqual({(row["appeal_id"], row["telegram_id"]) for row in ready},
+                         {("UNIQUE", 444), ("SHARED", 123456789), ("SHORTCUT", 444)})
+        self.assertTrue(all(self.db.details(key)[0]["employee_id"] is None
+                            for key in ("AMBIGUOUS", "UNKNOWN", "CONFLICT")))
+
+    async def test_standard_excel_keeps_slash_id_on_import_and_export(self):
+        identifier = "L-TEST/2026-00001"
+        headers = ["id", "mijoz_ismi", "telefon", "murojaat_matni", "yuborish_vaqti"]
+        payload = workbook_bytes(headers, [[identifier, "Test Client", "900000002", "Test body", None]])
+        rows = parse_excel(payload, "appeals", TZ)
+        self.assertEqual(self.db.import_appeals(rows), (1, 0))
+        self.assertEqual(self.db.details(identifier)[0]["id"], identifier)
+        exported = appeals_workbook(self.db.export_appeals(), TZ)
+        reimported = parse_excel(exported.getvalue(), "appeals", TZ)
+        self.assertEqual(reimported[0]["id"], identifier)
+        self.assertEqual(self.db.import_appeals(reimported), (0, 1))
+
     async def test_excel_edit_roundtrip_and_sent_immutability(self):
         item = appeal()
         item.update(legacy=True, phone="Ko'rsatilmagan", client_name="Test " * 100,
@@ -860,7 +1114,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_contact_join_requires_own_contact_and_admin_approval(self):
         self.db.import_employees([employee("Other", "phone:+998900000003", "+998900000003")])
         message = SimpleNamespace(reply_text=AsyncMock(), contact=SimpleNamespace(user_id=111, phone_number="998900000003"))
-        update = SimpleNamespace(effective_user=SimpleNamespace(id=222), effective_message=message)
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=222, username=None), effective_message=message)
         context = SimpleNamespace(bot_data={"db": self.db, "settings": self.settings, "service": self.service}, user_data={"join": True})
         await join_contact(update, context)
         self.assertEqual(self.db.pending_joins(), [])
@@ -959,17 +1213,53 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(r['status']=='blocked' and r['attempts']==0 for r in states))
         self.assertEqual(self.channel('sms', 'BOTH')['status'], 'blocked')
 
-    async def test_cross_employee_phone_duplicates_rollback(self):
-        first = employee('First', '333', '+998900000003')
-        first['phone_extra'] = '+998900000004'
-        self.db.import_employees([first])
-        for phone, extra in [('+998900000003', None), ('+998900000004', None),
-                             ('+998900000005', '+998900000003'), ('+998900000005', '+998900000004')]:
-            other = employee('Other', '444', phone, 7)
-            other['phone_extra'] = extra
-            with self.assertRaisesRegex(ValidationError, '7-qator.*telefon'):
-                self.db.import_employees([employee('Rollback', '555', '+998900000099'), other])
-            self.assertNotIn('Rollback', [r['name'] for r in self.db.employee_list()])
+    async def test_shared_phone_sends_both_employees_their_own_appeals(self):
+        shared_phone = '+998900000003'
+        first = employee('First', '333', shared_phone)
+        second = dict(employee('Second', '@second_worker', '+998900000004'), phone_extra=shared_phone)
+        self.db.import_employees([first, second])
+        with self.assertRaisesRegex(ValueError, 'bir nechta xodimda'):
+            self.db.join_by_phone(shared_phone, 555)
+        self.assertEqual(self.db.pending_joins(), [])
+        for telegram_id, username in ((333, None), (444, 'SECOND_WORKER')):
+            request = self.db.join_by_phone(shared_phone, telegram_id, username)
+            self.db.decide_join(request, True, 987)
+        self.assertIsNone(self.db.join_by_phone(shared_phone, 444, 'renamed_worker'))
+
+        now = time.time() - 5
+        self.db.import_appeals([appeal('FIRST', now, 'First'), appeal('SECOND', now, 'Second')])
+        await self.service.tick()
+        telegram_tasks = {call.kwargs['chat_id']: call.kwargs['text'] for call in self.bot.send_message.await_args_list}
+        self.assertIn('#FIRST', telegram_tasks[333])
+        self.assertIn('#SECOND', telegram_tasks[444])
+        self.assertEqual([call.args[0] for call in self.sms.await_args_list].count(shared_phone), 2)
+        self.assertEqual(self.channel('sms', 'FIRST')['status'], 'sent')
+        self.assertEqual(self.channel('sms', 'SECOND')['status'], 'sent')
+
+    def test_shared_phone_schema_upgrade_keeps_employee_links(self):
+        path = self.settings.database.with_name("old-phones.db")
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.executescript("""
+                CREATE TABLE employees (
+                    id INTEGER PRIMARY KEY, name TEXT NOT NULL, name_key TEXT UNIQUE NOT NULL,
+                    phone TEXT UNIQUE NOT NULL, telegram_ref TEXT UNIQUE NOT NULL, telegram_id INTEGER,
+                    shift TEXT NOT NULL DEFAULT '', approved INTEGER NOT NULL DEFAULT 0, phone_extra TEXT
+                );
+                CREATE TABLE appeals (
+                    id TEXT PRIMARY KEY, client_name TEXT NOT NULL, phone TEXT NOT NULL,
+                    body TEXT NOT NULL, due_at REAL, employee_id INTEGER REFERENCES employees(id),
+                    created_at REAL NOT NULL, source_user INTEGER
+                );
+                INSERT INTO employees VALUES (7,'First','first','+998900000003','phone:+998900000003',333,'',1,NULL);
+                INSERT INTO appeals VALUES ('OLD','Test','+998900000009','Test',NULL,7,1,NULL);
+            """)
+        upgraded = Database(path)
+        upgraded.import_employees([employee('Second', 'phone:+998900000003', '+998900000003')])
+        self.assertEqual(upgraded.details('OLD')[0]['employee_id'], 7)
+        self.assertIsNone(upgraded.join_by_phone('+998900000003', 333))
+        with upgraded.connect() as connection:
+            self.assertIsNone(connection.execute('PRAGMA foreign_key_check').fetchone())
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM employees WHERE approved=1').fetchone()[0], 1)
 
     async def test_sms_manual_retry_only_retries_failed_recipient(self):
         row = employee()
@@ -1129,6 +1419,23 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConfigurationSecurityTests(unittest.TestCase):
+    def test_sms_password_command_uses_local_prompt_and_skips_environment_loading(self):
+        password = "synthetic local password"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bot.db"
+            with patch.object(Settings, "database", path), patch.object(sys, "argv", ["main.py", "--set-sms-password"]), \
+                    patch("main.sys.stdin.isatty", return_value=True), patch("main.getpass", side_effect=[password, password]), \
+                    patch("main.load_settings") as load_settings_mock, patch("builtins.print") as output:
+                run_main()
+            load_settings_mock.assert_not_called()
+            self.assertNotIn(password, repr(output.call_args_list))
+            database = Database(path)
+            self.assertTrue(database.sms_password_configured())
+            with database.connect() as connection:
+                stored = connection.execute("SELECT value FROM settings WHERE key='sms_password_hash'").fetchone()[0]
+            self.assertNotIn(password, stored)
+            self.assertEqual(database.change_sms_with_password(False, password, 987), "changed")
+
     def test_admin_ids_come_only_from_dotenv_without_interpolation(self):
         environment = {'BOT_TOKEN': '123:synthetic', 'ADMIN_IDS': '555', 'TIMEZONE': 'UTC'}
         with patch.dict(os.environ, environment, clear=True), patch('config.load_dotenv'), \
